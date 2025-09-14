@@ -24,6 +24,10 @@
 
 #include <ctype.h>
 
+static int csv_contains_id(const char* csv, uint64 wanted);  /* <-- move here */
+static int icmp(const char* a, const char* b);
+
+
 #define MAX_GROUPS 256
 typedef struct {
     uint64 id;
@@ -38,6 +42,23 @@ typedef struct {
 } GroupCache;
 
 static GroupCache g_cache = {0};
+
+typedef struct {
+    const char* name;      /* token label */
+    uint64 ids[16];        /* all matching group IDs for this token */
+    int m;                 /* count */
+} GroupSet;
+
+static int client_matches_sets(const char* csv, const GroupSet* sets, int sN) {
+    for (int s = 0; s < sN; ++s) {           /* AND across tokens */
+        int ok = 0;
+        for (int j = 0; j < sets[s].m; ++j)  /* OR within token */
+            if (csv_contains_id(csv, sets[s].ids[j])) { ok = 1; break; }
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 
 
 static struct TS3Functions ts3Functions;
@@ -109,7 +130,7 @@ const char* ts3plugin_name()
 /* Plugin version   */
 const char* ts3plugin_version()
 {
-    return "1.2";
+    return "1.0.0";
 }
 
 /* Plugin API version. Must be the same as the clients API major version, else the plugin fails to load. */
@@ -304,27 +325,6 @@ static int split_quoted_args(const char* s, char*** outv) {
     return (int)argc;
 }
 
-/* try to resolve a token to a server-group id:
-   - numeric => that id
-   - name    => use cache
-   returns 0 if not found */
-static uint64 token_to_group_id(uint64 schid, const char* tok) {
-    char* endp = NULL;
-    long v = strtol(tok, &endp, 10);
-    if (endp && *endp == '\0' && v > 0) return (uint64)v;
-    if (!g_cache.ready) return 0;
-    return resolve_group_id_by_name(schid, tok);
-}
-
-/* return 1 if CSV contains all wanted gids, else 0 */
-static int has_all_groups(const char* csv, const uint64* want, int want_n) {
-    for (int i = 0; i < want_n; ++i) {
-        if (!csv_contains_id(csv, want[i])) return 0;
-    }
-    return 1;
-}
-
-
 /* /findgroup <group_id_or_name> */
 /* /findgroup <group1> [<group2> ...]  (names may be quoted) */
 int ts3plugin_processCommand(uint64 schid, const char* command)
@@ -342,51 +342,43 @@ int ts3plugin_processCommand(uint64 schid, const char* command)
         return 0;
     }
 
-    /* Resolve all tokens to group IDs */
-    uint64 gids[32];
-    const char* displayNames[32];
-    int n = 0;
+    /* Build per-token ID sets */
+    GroupSet sets[32]; int sN = 0;
 
-    for (int i = 0; i < argc; ++i) {
-        if (!argv[i] || !argv[i][0]) continue;
+    for (int i = 0; i < argc && sN < 32; ++i) {
+        const char* tok = argv[i];
+        if (!tok || !*tok) continue;
 
-        uint64 gid = token_to_group_id(schid, argv[i]);
-        if (!gid) {
-            char msg[256];
-            if (!g_cache.ready) {
+        GroupSet gs = {0};
+        char* endp = NULL; long v = strtol(tok, &endp, 10);
+        if (endp && *endp == '\0' && v > 0) {        /* numeric token -> single ID */
+            gs.ids[gs.m++] = (uint64)v;
+            const char* nm = resolve_group_name_by_id(schid, (uint64)v);
+            gs.name = nm ? nm : tok;
+        } else {                                      /* name token -> all matching IDs */
+            if (g_cache.schid != schid || !g_cache.ready) {
                 ts3Functions.printMessageToCurrentTab("Group list not ready yet. Try again in a moment.");
-            } else {
-                snprintf(msg, sizeof(msg), "No matching server-group found for \"%s\".", argv[i]);
-                ts3Functions.printMessageToCurrentTab(msg);
+                goto abort_cmd;
             }
-            for (int k = 0; k < argc; ++k) if (argv[k]) free(argv[k]);
-            free(argv);
-            return 0;
-        }
+            int added_exact = 0;
+            for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
+                if (strcmp(g_cache.items[k].name, tok)==0)
+                    gs.ids[gs.m++] = g_cache.items[k].id, added_exact=1;
+            if (!added_exact)
+                for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
+                    if (icmp(g_cache.items[k].name, tok)==0)
+                        gs.ids[gs.m++] = g_cache.items[k].id;
 
-        /* Deduplicate */
-        {
-            int dup = 0;
-            for (int j = 0; j < n; ++j) if (gids[j] == gid) { dup = 1; break; }
-            if (dup) continue;
+            if (gs.m == 0) {
+                char msg[256]; snprintf(msg,sizeof(msg),"No matching server-group(s) found for \"%s\".", tok);
+                ts3Functions.printMessageToCurrentTab(msg);
+                goto abort_cmd;
+            }
+            gs.name = tok; /* show the requested token */
         }
-
-        gids[n] = gid;
-        {
-            const char* nm = resolve_group_name_by_id(schid, gid);
-            displayNames[n] = nm ? nm : argv[i];
-        }
-        ++n;
-        if (n >= (int)(sizeof(gids)/sizeof(gids[0]))) break; /* safety cap */
+        sets[sN++] = gs;
     }
-
-    for (int k = 0; k < argc; ++k) if (argv[k]) free(argv[k]);
-    free(argv);
-
-    if (n <= 0) {
-        ts3Functions.printMessageToCurrentTab("No valid groups provided.");
-        return 0;
-    }
+    if (sN == 0) { ts3Functions.printMessageToCurrentTab("No valid groups provided."); goto abort_cmd; }
 
     /* Get clients */
     anyID* clids = NULL;
@@ -401,28 +393,33 @@ int ts3plugin_processCommand(uint64 schid, const char* command)
         char* sgroups = NULL;
         if (ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_SERVERGROUPS, &sgroups) != ERROR_ok || !sgroups)
             continue;
-        if (has_all_groups(sgroups, gids, n)) ++hits;
+        if (client_matches_sets(sgroups, sets, sN)) ++hits;
         ts3Functions.freeMemory(sgroups);
     }
 
     /* Header: Found N user(s) in groups "..." */
     /* Header: Found N user(s) in groups "..." (id X), ... */
-    char namesBuf[384] = {0};
-    for (int i = 0; i < n; ++i) {
-        char piece[160];
-        if (displayNames[i] && *displayNames[i]) {
-            snprintf(piece, sizeof(piece), "%s\"%s\" (id %llu)",
-                    (i ? ", " : ""), displayNames[i], (unsigned long long)gids[i]);
-        } else {
-            snprintf(piece, sizeof(piece), "%s%llu", (i ? ", " : ""), (unsigned long long)gids[i]);
+    char namesBuf[512] = {0};
+    for (int s=0; s<sN; ++s) {
+        char idsPart[192] = {0};
+        for (int j=0; j<sets[s].m; ++j) {
+            char tmp[32];
+            snprintf(tmp,sizeof(tmp), "%s%llu", (j?", ":""), (unsigned long long)sets[s].ids[j]);
+            strncat(idsPart, tmp, sizeof(idsPart)-strlen(idsPart)-1);
         }
-        strncat(namesBuf, piece, sizeof(namesBuf) - strlen(namesBuf) - 1);
+        char piece[256];
+        snprintf(piece,sizeof(piece), "%s\"%s\" (id %s)", (s?", ":""), (sets[s].name?sets[s].name:""), idsPart);
+        strncat(namesBuf, piece, sizeof(namesBuf)-strlen(namesBuf)-1);
     }
+
 
 
     char head[512];
     snprintf(head, sizeof(head), "Found %llu user(s) in group%s %s:",
-             (unsigned long long)hits, (n > 1 ? "s" : ""), namesBuf[0] ? namesBuf : "(unknown)");
+         (unsigned long long)hits,
+         (sN > 1 ? "s" : ""),
+         namesBuf[0] ? namesBuf : "(unknown)");
+
     ts3Functions.printMessageToCurrentTab(head);
 
     /* Print each match as a clickable link */
@@ -431,7 +428,7 @@ int ts3plugin_processCommand(uint64 schid, const char* command)
         if (ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_SERVERGROUPS, &sgroups) != ERROR_ok || !sgroups)
             continue;
 
-        if (has_all_groups(sgroups, gids, n)) {
+        if (client_matches_sets(sgroups, sets, sN)) {
             char* uid  = NULL;
             char* nick = NULL;
             if (ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_UNIQUE_IDENTIFIER, &uid)  == ERROR_ok &&
@@ -447,6 +444,9 @@ int ts3plugin_processCommand(uint64 schid, const char* command)
     }
 
     ts3Functions.freeMemory(clids);
+    abort_cmd:
+    for (int k = 0; k < argc; ++k) if (argv && argv[k]) free(argv[k]);
+    if (argv) free(argv);
     return 0;
 }
 
@@ -517,11 +517,18 @@ static void cache_reset(uint64 schid) {
 
 static void cache_add(uint64 schid, uint64 sgid, const char* name) {
     if (g_cache.schid != schid) return;
+
+    /* skip if we already have this group id */
+    for (size_t i = 0; i < g_cache.count; ++i) {
+        if (g_cache.items[i].id == sgid) return;
+    }
+
     if (g_cache.count >= MAX_GROUPS) return;
     g_cache.items[g_cache.count].id = sgid;
-    _strcpy(g_cache.items[g_cache.count].name, sizeof(g_cache.items[g_cache.count].name), name);
+    _strcpy(g_cache.items[g_cache.count].name, sizeof(g_cache.items[g_cache.count].name), name ? name : "");
     g_cache.count++;
 }
+
 
 /* case-insensitive strcmp */
 static int icmp(const char* a, const char* b) {
