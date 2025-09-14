@@ -1,7 +1,1 @@
-﻿Name = Group Finder
-Type = Plugin
-Author = PhysicsGaunt
-Version = 1.0
-Platforms = win32, win64
-
-Description = Find users by server group and print clickable PM links.
+# ts3 plugin to find online users by their server groups. Made by PhysicsGaunt
