@@ -406,15 +406,19 @@ int ts3plugin_processCommand(uint64 schid, const char* command)
     }
 
     /* Header: Found N user(s) in groups "..." */
+    /* Header: Found N user(s) in groups "..." (id X), ... */
     char namesBuf[384] = {0};
     for (int i = 0; i < n; ++i) {
         char piece[160];
-        if (displayNames[i] && *displayNames[i])
-            snprintf(piece, sizeof(piece), "%s\"%s\"", (i ? ", " : ""), displayNames[i]);
-        else
+        if (displayNames[i] && *displayNames[i]) {
+            snprintf(piece, sizeof(piece), "%s\"%s\" (id %llu)",
+                    (i ? ", " : ""), displayNames[i], (unsigned long long)gids[i]);
+        } else {
             snprintf(piece, sizeof(piece), "%s%llu", (i ? ", " : ""), (unsigned long long)gids[i]);
+        }
         strncat(namesBuf, piece, sizeof(namesBuf) - strlen(namesBuf) - 1);
     }
+
 
     char head[512];
     snprintf(head, sizeof(head), "Found %llu user(s) in group%s %s:",
