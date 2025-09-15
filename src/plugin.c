@@ -261,7 +261,7 @@ void ts3plugin_registerPluginID(const char* id) {
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon){
     *menuIcon = NULL;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * 2);
-    (*menuItems)[0] = createMenuItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_PULL_ALL, "Pull all users to current channel!", "");
+    (*menuItems)[0] = createMenuItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_PULL_ALL, "Pull all users to current channel!", "icons/pull.png");
     (*menuItems)[1] = NULL;
 }
 
