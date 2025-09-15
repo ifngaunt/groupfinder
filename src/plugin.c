@@ -1,5 +1,5 @@
 /*
- * TeamSpeak 3 Group Finder plugin (cleaned)
+ * TeamSpeak 3 Groupfinder (cleaned)
  *
  * Keeps only what the TS3 client actually needs for:
  *  - loading the plugin
@@ -218,19 +218,19 @@ const char* ts3plugin_name() {
 #ifdef _WIN32
     static char* result = NULL; /* allocate once */
     if (!result) {
-        const wchar_t* name = L"Group Finder Plugin";
-        if (wcharToUtf8(name, &result) == -1) result = "Group Finder Plugin"; /* fallback */
+        const wchar_t* name = L"Groupfinder";
+        if (wcharToUtf8(name, &result) == -1) result = "Groupfinder"; /* fallback */
     }
     return result;
 #else
-    return "Group Finder Plugin";
+    return "Groupfinder";
 #endif
 }
 
 const char* ts3plugin_version() { return "1.0.0"; }
 int ts3plugin_apiVersion() { return PLUGIN_API_VERSION; }
 const char* ts3plugin_author() { return "PhysicsGaunt"; }
-const char* ts3plugin_description() { return "Find users by (server) group."; }
+const char* ts3plugin_description() { return "Find users by (server) group. Also, allows some extra options to pull efficiently."; }
 
 void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3Functions = funcs; }
 
@@ -261,7 +261,7 @@ void ts3plugin_registerPluginID(const char* id) {
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon){
     *menuIcon = NULL;
     *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * 2);
-    (*menuItems)[0] = createMenuItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_PULL_ALL, "Pull everyone here", "");
+    (*menuItems)[0] = createMenuItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_PULL_ALL, "Pull all users to current channel!", "");
     (*menuItems)[1] = NULL;
 }
 
