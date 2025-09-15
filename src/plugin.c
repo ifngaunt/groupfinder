@@ -227,7 +227,7 @@ const char* ts3plugin_name() {
 #endif
 }
 
-const char* ts3plugin_version() { return "1.0.0"; }
+const char* ts3plugin_version() { return "1.0.2"; }
 int ts3plugin_apiVersion() { return PLUGIN_API_VERSION; }
 const char* ts3plugin_author() { return "PhysicsGaunt"; }
 const char* ts3plugin_description() { return "Find users by (server) group. Also, allows some extra options to pull efficiently."; }
