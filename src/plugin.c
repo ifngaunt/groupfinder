@@ -58,6 +58,20 @@
 
 #define PATH_BUFSIZE 512
 #define INFODATA_BUFSIZE 128
+#define CHANNELINFO_BUFSIZE 512
+enum { MENU_ID_CHANNEL_PULL_ALL = 1001 };
+
+static struct PluginMenuItem* createMenuItem(enum PluginMenuType type, int id, const char* text, const char* icon){
+    struct PluginMenuItem* m = (struct PluginMenuItem*)malloc(sizeof(struct PluginMenuItem));
+    m->type = type; m->id = id;
+    _strcpy(m->text, PLUGIN_MENU_BUFSZ, text);
+    _strcpy(m->icon, PLUGIN_MENU_BUFSZ, icon ? icon : "");
+    return m;
+}
+
+/* required when using menus */
+void ts3plugin_freeMemory(void* p){ free(p); }
+
 
 static struct TS3Functions ts3Functions;
 static char* pluginID = NULL; /* set by ts3plugin_registerPluginID() */
@@ -244,6 +258,14 @@ void ts3plugin_registerPluginID(const char* id) {
     printf("PLUGIN: registerPluginID: %s\n", pluginID);
 }
 
+void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon){
+    *menuIcon = NULL;
+    *menuItems = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * 2);
+    (*menuItems)[0] = createMenuItem(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_PULL_ALL, "Pull everyone here", "");
+    (*menuItems)[1] = NULL;
+}
+
+
 /* Make our "/findgroup" command available */
 const char* ts3plugin_commandKeyword() { return "findgroup"; }
 
@@ -266,6 +288,41 @@ void ts3plugin_onServerGroupListEvent(uint64 schid, uint64 serverGroupID, const 
 void ts3plugin_onServerGroupListFinishedEvent(uint64 schid) {
     if (g_cache.schid == schid) g_cache.ready = 1;
 }
+
+static void pull_all_from_channel(uint64 schid, uint64 srcChannelID){
+    anyID myID; uint64 myChan = 0;
+    if(ts3Functions.getClientID(schid, &myID) != ERROR_ok) return;
+    if(ts3Functions.getChannelOfClient(schid, myID, &myChan) != ERROR_ok) return;
+    if(!myChan || myChan == srcChannelID){
+        ts3Functions.printMessageToCurrentTab("Nothing to pull (same channel).");
+        return;
+    }
+
+    char path[CHANNELINFO_BUFSIZE]; char password[CHANNELINFO_BUFSIZE];
+    memset(password, 0, sizeof(password));
+    if(ts3Functions.getChannelConnectInfo(schid, myChan, path, password, CHANNELINFO_BUFSIZE) != 0){
+        password[0] = '\0';
+    }
+
+    anyID* clids = NULL;
+    if(ts3Functions.getChannelClientList(schid, srcChannelID, &clids) != ERROR_ok || !clids){
+        ts3Functions.printMessageToCurrentTab("Could not read clients in source channel.");
+        return;
+    }
+
+    unsigned moved = 0, failed = 0;
+    for(size_t i=0; clids[i]; ++i){
+        if(clids[i] == myID) continue;
+        unsigned int e = ts3Functions.requestClientMove(schid, clids[i], myChan, password[0] ? password : "", NULL);
+        if(e == ERROR_ok) ++moved; else ++failed;
+    }
+    ts3Functions.freeMemory(clids);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Pull complete: moved %u, failed %u.", moved, failed);
+    ts3Functions.printMessageToCurrentTab(msg);
+}
+
 
 /* ------------------------------ Command implementation ------------------------------ */
 /* /findgroup <group_id_or_name> [<group_id_or_name> ...] (names may be quoted) */
@@ -411,4 +468,10 @@ done:
         free(argv);
     }
     return 0;
+}
+
+void ts3plugin_onMenuItemEvent(uint64 schid, enum PluginMenuType type, int menuItemID, uint64 selectedItemID){
+    if(type == PLUGIN_MENU_TYPE_CHANNEL && menuItemID == MENU_ID_CHANNEL_PULL_ALL){
+        pull_all_from_channel(schid, selectedItemID);
+    }
 }
