@@ -21,8 +21,10 @@
  */
 
 #if defined(WIN32) || defined(__WIN32__) || defined(_WIN32)
-#pragma warning(disable : 4100)
-#include <Windows.h>
+  #if defined(_MSC_VER)
+    #pragma warning(disable : 4100)
+  #endif
+  #include <Windows.h>
 #endif
 
 #include <assert.h>
@@ -69,19 +71,6 @@ static int wcharToUtf8(const wchar_t* str, char** result) {
         return -1;
     }
     return 0;
-}
-#endif
-
-static int has_flag(int argc, char** argv, const char* flag){
-    for(int i=0;i<argc;++i) if(argv[i] && strcmp(argv[i], flag)==0) return 1;
-    return 0;
-}
-#ifdef _WIN32
-static int confirm_pull_windows(size_t n){
-    char msg[256]; 
-    snprintf(msg,sizeof(msg),"Pull %llu client(s) to your channel?", (unsigned long long)n);
-    return MessageBoxA(NULL, msg, "Confirm Pull",
-                       MB_ICONWARNING|MB_YESNO|MB_DEFBUTTON2)==IDYES;
 }
 #endif
 
@@ -313,13 +302,6 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
         if (argv[i] && strcmp(argv[i], "--pull") == 0) { want_pull = 1; continue; }
         ++nonflag_tokens;
     }
-
-    /* ---------- Build per-token ID sets ---------- */
-    typedef struct {
-        const char* name;  /* token label */
-        uint64 ids[16];
-        int m;
-    } GroupSet;
 
     GroupSet sets[32];
     int sN = 0;
