@@ -21,9 +21,12 @@
  */
 
 #if defined(WIN32) || defined(__WIN32__) || defined(_WIN32)
-#pragma warning(disable : 4100)
-#include <Windows.h>
+  #if defined(_MSC_VER)
+    #pragma warning(disable : 4100)  /* MSVC: unreferenced formal parameter */
+  #endif
+  #include <windows.h>
 #endif
+
 
 #include <assert.h>
 #include <ctype.h>
