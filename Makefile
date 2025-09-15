@@ -2,7 +2,7 @@
 CC       = x86_64-w64-mingw32-gcc
 CFLAGS   = -O2 -Wall -Wextra -Iinclude -DWIN32 -D_WIN32 -D__WIN32__
 LDFLAGS  = -shared
-TARGET   = test_plugin.dll
+TARGET   = groupfinder.dll
 OBJS     = src/plugin.o
 
 all: $(TARGET)
