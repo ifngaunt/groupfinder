@@ -267,26 +267,47 @@ void ts3plugin_onServerGroupListFinishedEvent(uint64 schid) {
 /* ------------------------------ Command implementation ------------------------------ */
 /* /findgroup <group_id_or_name> [<group_id_or_name> ...] (names may be quoted) */
 int ts3plugin_processCommand(uint64 schid, const char* command) {
+    static const char* kUsage =
+        "Usage: /findgroup <group_id_or_name> [<group_id_or_name> ...]\n"
+        "Notes:\n"
+        "  • Names may be quoted, matching is case-insensitive for names.\n"
+        "  • Multiple tokens are ANDed; IDs within a token are ORed (for name matches).\n"
+        "Examples:\n"
+        "  /findgroup 62\n"
+        "  /findgroup \"Head Administrator\" \"Rust\"";
+
     /* Parse args with quote support */
-    char** argv = NULL; int argc = split_quoted_args(command, &argv);
+    char** argv = NULL; 
+    int argc = split_quoted_args(command, &argv);
+
+    /* TS3 does not invoke us for a bare '/findgroup', but allow explicit help. */
+    if (argc == 1 && (
+            icmp(argv[0], "help") == 0 ||
+            icmp(argv[0], "-h") == 0 ||
+            icmp(argv[0], "--help") == 0 ||
+            icmp(argv[0], "?") == 0)) 
+    {
+        ts3Functions.printMessageToCurrentTab(kUsage);
+        goto done;
+    }
+
     if (argc <= 0) {
-        ts3Functions.printMessageToCurrentTab(
-            "Usage: /findgroup <group_id_or_name> [<group_id_or_name> ...]\n"
-            "Examples:\n"
-            "  /findgroup 62\n"
-            "  /findgroup \"Head Administrator\" \"Rust\"");
-        if (argv) free(argv);
-        return 0;
+        /* Defensive: unreachable for bare '/findgroup' (TS3 intercepts), harmless otherwise. */
+        goto done;
     }
 
     /* Build per-token ID sets */
-    GroupSet sets[32]; int sN = 0;
+    GroupSet sets[32]; 
+    int sN = 0;
+
     for (int i = 0; i < argc && sN < 32; ++i) {
         const char* tok = argv[i];
         if (!tok || !*tok) continue;
 
         GroupSet gs = {0};
-        char* endp = NULL; long v = strtol(tok, &endp, 10);
+        char* endp = NULL; 
+        long v = strtol(tok, &endp, 10);
+
         if (endp && *endp == '\0' && v > 0) {        /* numeric token -> single ID */
             gs.ids[gs.m++] = (uint64)v;
             const char* nm = resolve_group_name_by_id(schid, (uint64)v);
@@ -294,33 +315,39 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
         } else {                                      /* name token -> all matching IDs */
             if (g_cache.schid != schid || !g_cache.ready) {
                 ts3Functions.printMessageToCurrentTab("Group list not ready yet. Try again in a moment.");
-                goto abort_cmd;
+                goto done;
             }
             int added_exact = 0;
-            for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
-                if (strcmp(g_cache.items[k].name, tok)==0)
-                    gs.ids[gs.m++] = g_cache.items[k].id, added_exact=1;
+            for (size_t k = 0; k < g_cache.count && gs.m < 16; ++k)
+                if (strcmp(g_cache.items[k].name, tok) == 0)
+                    gs.ids[gs.m++] = g_cache.items[k].id, added_exact = 1;
             if (!added_exact)
-                for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
-                    if (icmp(g_cache.items[k].name, tok)==0)
+                for (size_t k = 0; k < g_cache.count && gs.m < 16; ++k)
+                    if (icmp(g_cache.items[k].name, tok) == 0)
                         gs.ids[gs.m++] = g_cache.items[k].id;
 
             if (gs.m == 0) {
-                char msg[256]; snprintf(msg,sizeof(msg),"No matching server-group(s) found for \"%s\".", tok);
+                char msg[256]; 
+                snprintf(msg, sizeof(msg), "No matching server-group(s) found for \"%s\".", tok);
                 ts3Functions.printMessageToCurrentTab(msg);
-                goto abort_cmd;
+                goto done;
             }
             gs.name = tok; /* show the requested token */
         }
         sets[sN++] = gs;
     }
-    if (sN == 0) { ts3Functions.printMessageToCurrentTab("No valid groups provided."); goto abort_cmd; }
+
+    if (sN == 0) { 
+        ts3Functions.printMessageToCurrentTab("No valid groups provided.\n\n" \
+                                              "Tip: '/findgroup help' shows usage.");
+        goto done; 
+    }
 
     /* Get clients */
     anyID* clids = NULL;
     if (ts3Functions.getClientList(schid, &clids) != ERROR_ok || !clids) {
         ts3Functions.logMessage("Could not get client list", LogLevel_ERROR, "Plugin", schid);
-        goto abort_cmd;
+        goto done;
     }
 
     /* Count matches */
@@ -334,20 +361,24 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
     }
 
     /* Header: Found N user(s) in group(s) ... */
-    char namesBuf[512] = {0};
-    for (int s=0; s<sN; ++s) {
-        char idsPart[192] = {0};
-        for (int j=0; j<sets[s].m; ++j) {
-            char tmp[32]; snprintf(tmp,sizeof(tmp), "%s%llu", (j?", ":""), (unsigned long long)sets[s].ids[j]);
-            strncat(idsPart, tmp, sizeof(idsPart)-strlen(idsPart)-1);
+    {
+        char namesBuf[512] = {0};
+        for (int s = 0; s < sN; ++s) {
+            char idsPart[192] = {0};
+            for (int j = 0; j < sets[s].m; ++j) {
+                char tmp[32]; 
+                snprintf(tmp, sizeof(tmp), "%s%llu", (j ? ", " : ""), (unsigned long long)sets[s].ids[j]);
+                strncat(idsPart, tmp, sizeof(idsPart) - strlen(idsPart) - 1);
+            }
+            char piece[256]; 
+            snprintf(piece, sizeof(piece), "%s\"%s\" (id %s)", (s ? ", " : ""), (sets[s].name ? sets[s].name : ""), idsPart);
+            strncat(namesBuf, piece, sizeof(namesBuf) - strlen(namesBuf) - 1);
         }
-        char piece[256]; snprintf(piece,sizeof(piece), "%s\"%s\" (id %s)", (s?", ":""), (sets[s].name?sets[s].name:""), idsPart);
-        strncat(namesBuf, piece, sizeof(namesBuf)-strlen(namesBuf)-1);
+        char head[512];
+        snprintf(head, sizeof(head), "Found %llu user(s) in group%s %s:",
+                 (unsigned long long)hits, (sN > 1 ? "s" : ""), namesBuf[0] ? namesBuf : "(unknown)");
+        ts3Functions.printMessageToCurrentTab(head);
     }
-    char head[512];
-    snprintf(head, sizeof(head), "Found %llu user(s) in group%s %s:",
-         (unsigned long long)hits, (sN > 1 ? "s" : ""), namesBuf[0] ? namesBuf : "(unknown)");
-    ts3Functions.printMessageToCurrentTab(head);
 
     /* Print each match as a clickable link */
     for (size_t i = 0; clids[i]; ++i) {
@@ -355,10 +386,12 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
         if (ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_SERVERGROUPS, &sgroups) != ERROR_ok || !sgroups)
             continue;
         if (client_matches_sets(sgroups, sets, sN)) {
-            char* uid  = NULL; char* nick = NULL;
+            char* uid  = NULL; 
+            char* nick = NULL;
             if (ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_UNIQUE_IDENTIFIER, &uid)  == ERROR_ok &&
                 ts3Functions.getClientVariableAsString(schid, clids[i], CLIENT_NICKNAME,          &nick) == ERROR_ok) {
-                char line[512]; snprintf(line, sizeof(line), "[URL=client://%u/%s]%s[/URL]", (unsigned)clids[i], uid, nick);
+                char line[512]; 
+                snprintf(line, sizeof(line), "[URL=client://%u/%s]%s[/URL]", (unsigned)clids[i], uid, nick);
                 ts3Functions.printMessageToCurrentTab(line);
             }
             if (uid)  ts3Functions.freeMemory(uid);
@@ -369,8 +402,10 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
 
     ts3Functions.freeMemory(clids);
 
-abort_cmd:
-    for (int k = 0; k < argc; ++k) if (argv && argv[k]) free(argv[k]);
-    if (argv) free(argv);
+done:
+    if (argv) {
+        for (int k = 0; k < argc; ++k) if (argv[k]) free(argv[k]);
+        free(argv);
+    }
     return 0;
 }
