@@ -9,3 +9,11 @@ In a channel chat, type
 ```
 
 this will show all online clients which have all the channel groups listed.
+
+![Example image 1](imgs/1.png)
+
+![Example image 2](imgs/2.png)
+
+![Example image 3](imgs/3.png)
+
+![Example image 4](imgs/4.png)
