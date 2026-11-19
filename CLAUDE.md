@@ -84,6 +84,13 @@ here… (CHANNEL). Hotkeys: `gf_open_meetings`, `gf_join_next`, `gf_cancel_move`
 - Every window must be destroyed in `ts3plugin_shutdown` — including closed ones whose deferred delete
   hasn't run — or TS3 crashes after the DLL unloads.
 - Callbacks can arrive on non-GUI threads: never touch widgets directly from a `ts3plugin_*` function.
+- `getChannelIDFromChannelNames(schid, names, &id)`: `names` must end with an **empty string `""`**, not NULL —
+  TS3 dereferences every entry until `""` (a NULL terminator crashed 1.3.0 on "Join now"; found via crash dump).
+  The SDK header doesn't document this; when an API takes a list, check the TS3 ClientLib docs or a dump.
+- Debugging real crashes: TS3 writes `%APPDATA%\TS3Client\crashdumps\ts3dump_*.zip`; extract and run
+  `cdb.exe -z <dmp> -c ".ecxr;k 40;q"` (Windows SDK Debuggers\x64). Frames show as `groupfinder!ts3plugin_version+0x…`
+  (nearest export): add that export's RVA, `objdump -d` the release DLL there, and map `call *0xNN(%reg)`
+  on the TS3Functions pointer to slot NN/8 of `struct TS3Functions`.
 - `guiConnect(PLUGIN_CONNECT_TAB_NEW_IF_CURRENT_CONNECTED, label, "host:port", serverPw, nick, channelPath, channelPw, "", …)`:
   empty strings = TS3 defaults. Channel path format is what `getChannelConnectInfo` returns ("Parent/Child").
 - Useful unused API: `requestServerGroupClientList` (offline members), `onServerGroupClientAdded/DeletedEvent`,
@@ -102,7 +109,7 @@ here… (CHANNEL). Hotkeys: `gf_open_meetings`, `gf_join_next`, `gf_cancel_move`
 - Not testable here: the real TS3 client (theme, `guiConnect` behaviour, real return codes). Manual checklist
   in `docs/superpowers/plans/2026-11-19-meeting-scheduler.md` Task 8.
 
-## Known issues / gotchas (as of 1.3.0)
+## Known issues / gotchas (as of 1.3.1)
 
 1. `processCommand` duplicates `build_groupsets_from_tokens` inline instead of calling it.
 2. Finder/alarm state is single-server: `g_cache` and `g_alarm_*` are globals keyed to the last connected

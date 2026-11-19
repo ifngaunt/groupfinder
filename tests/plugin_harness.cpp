@@ -276,7 +276,9 @@ unsigned int f_getChannelIDFromChannelNames(uint64 schid, char** names, uint64* 
     if (!connected(schid))
         return ERROR_not_connected;
     uint64 parent = 0;
-    for (int i = 0; names[i]; ++i) {
+    // Like the real client (verified from a TS3 crash dump): the array ends at an EMPTY STRING and every
+    // entry is dereferenced until then — a NULL terminator crashes TeamSpeak with an access violation.
+    for (int i = 0; names[i][0] != '\0'; ++i) {
         uint64 found = 0;
         for (const auto& c : kChannels)
             if (c.parent == parent && c.name == QString::fromUtf8(names[i]))

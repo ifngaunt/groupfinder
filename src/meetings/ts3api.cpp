@@ -164,10 +164,14 @@ quint64 resolveChannel(quint64 schid, const QString& path, quint64 fallbackId)
         QVector<QByteArray> utf8;
         for (const QString& p : parts)
             utf8 << p.toUtf8();
+        // TeamSpeak walks this array until an EMPTY STRING and dereferences every entry before that —
+        // a NULL terminator crashes the client (verified from a TS3 crash dump). The trailing nullptr is
+        // never reached; it only guards against implementations that stop at NULL instead.
+        static char kEnd[] = "";
         QVector<char*> names;
         for (QByteArray& b : utf8)
             names << b.data();
-        names << nullptr;
+        names << kEnd << nullptr;
         uint64 id = 0;
         if (F->getChannelIDFromChannelNames(schid, names.data(), &id) == ERROR_ok && id)
             return id;
