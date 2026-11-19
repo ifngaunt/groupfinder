@@ -5,3 +5,4 @@ class QObject;
 QObject* createTestSchedule();
 QObject* createTestMeeting();
 QObject* createTestFiring();
+QObject* createTestGroupQuery();

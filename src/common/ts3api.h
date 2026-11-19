@@ -28,7 +28,17 @@ struct ChannelEntry {
     int     depth = 0;
 };
 
+struct ClientEntry {
+    quint16 clid = 0;
+    QString nickname, uid;
+    QString groupsCsv;  // CLIENT_SERVERGROUPS, e.g. "6,13,62"
+    quint64 channelId = 0;
+};
+
 QVector<ServerTab>       connectedServers();
+QVector<ClientEntry>     clients(quint64 schid);  // everyone visible on that server
+QString                  channelName(quint64 schid, quint64 channelId);
+void                     requestServerGroups(quint64 schid);  // answer arrives as ts3plugin_onServerGroupList*Event
 std::optional<ServerTab> serverTab(quint64 schid);  // only when fully connected
 QVector<ChannelEntry>    channels(quint64 schid);   // tree order (parents before children, CHANNEL_ORDER)
 QString                  channelPassword(quint64 schid, quint64 channelId);

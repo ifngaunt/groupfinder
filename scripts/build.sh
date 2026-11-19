@@ -15,7 +15,7 @@ CMD=${1:-build}
 shift || true
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DIST="$REPO/dist"
-HARNESS_MODES_ALL="lifecycle execute warn thread screenshots edit modal"
+HARNESS_MODES_ALL="lifecycle execute warn thread screenshots edit modal alarm query limits unicode"
 
 winenv() { (cd /mnt/c && cmd.exe /c "echo %$1%" 2>/dev/null | tr -d '\r'); }
 die() { echo "build.sh: $*" >&2; exit 1; }

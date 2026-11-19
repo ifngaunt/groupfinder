@@ -12,7 +12,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     const QString outDir = qEnvironmentVariable("GF_TEST_OUT");
     int status = 0;
-    for (auto factory : {createTestSchedule, createTestMeeting, createTestFiring}) {
+    for (auto factory : {createTestSchedule, createTestMeeting, createTestFiring, createTestGroupQuery}) {
         std::unique_ptr<QObject> test(factory());
         QStringList args{QString::fromLocal8Bit(argv[0])};
         if (!outDir.isEmpty())

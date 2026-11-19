@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(groupfinder VERSION 1.3.1 LANGUAGES C CXX)
+project(groupfinder VERSION 1.4.0 LANGUAGES C CXX)
 
 # TeamSpeak 3 ships Qt 5.15.2 built with MSVC 2019 (x64). The plugin must link against the same
 # Qt (import libs from Qt 5.15.2 msvc2019_64) and be built in Release so it binds to Qt5Core.dll,
@@ -19,12 +19,19 @@ set(GF_LOGIC_SOURCES
   src/meetings/schedule.cpp
   src/meetings/meeting.cpp
   src/meetings/firing.cpp
+  src/query/groupquery.cpp
 )
 
 # Qt/TS3-facing meeting code.
 set(GF_MEETING_SOURCES
   src/meetings/gf_meetings.cpp
-  src/meetings/ts3api.cpp
+  src/common/ts3api.cpp
+  src/common/windowutil.cpp
+  src/query/gf_query.cpp
+  src/query/querycontroller.cpp
+  src/query/groupchecklist.cpp
+  src/query/finderwindow.cpp
+  src/query/alarmwindow.cpp
   src/meetings/meetingcontroller.cpp
   src/meetings/meetingdialog.cpp
   src/meetings/schedulerwindow.cpp
@@ -47,6 +54,9 @@ target_compile_definitions(groupfinder PRIVATE
 target_compile_options(groupfinder PRIVATE /utf-8 /W3)
 target_link_libraries(groupfinder PRIVATE Qt5::Core Qt5::Gui Qt5::Widgets)
 
+# Qt 5.15's qvector.h uses stdext::checked_array_iterator, which MSVC 17.8+ flags as deprecated (STL4043).
+add_compile_definitions(_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING)
+
 option(GF_BUILD_TESTS "Build unit tests and the plugin harness" OFF)
 if(GF_BUILD_TESTS)
   enable_testing()
@@ -57,6 +67,7 @@ if(GF_BUILD_TESTS)
     tests/test_schedule.cpp
     tests/test_meeting.cpp
     tests/test_firing.cpp
+    tests/test_groupquery.cpp
     ${GF_LOGIC_SOURCES}
   )
   target_include_directories(gf_tests PRIVATE src tests)

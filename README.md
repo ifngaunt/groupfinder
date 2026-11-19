@@ -5,14 +5,17 @@ then enable **Group Finder Plugin** in *Tools → Options → Addons → Plugins
 
 ## Find users by group
 
-In a channel chat, type
+*Plugins → Find Users by Group…* (or a hotkey): pick a server, tick groups from that server's group list, and see
+who is online in **all** ticked groups, with their channel — updated live. **Show in chat** prints the list as
+clickable names; **Set as connect alarm…** turns the ticked groups into an alarm.
+
+Or type it in a chat tab:
 
 ```
 /findgroup "[group1]" "[group2]"
 ```
 
-this will show all online clients which have all the server groups listed (IDs or names; names may be quoted).
-`/findgroup help` shows all options.
+(IDs or names; names may be quoted. `/findgroup help` shows all options.)
 
 ![Example image 1](imgs/1.png)
 
@@ -24,8 +27,12 @@ this will show all online clients which have all the server groups listed (IDs o
 
 ## Connect alarm
 
-`/findgroup alarm set "Head Administrator" Guest` then `/findgroup alarm on` — plays a sound and prints a
-clickable name when a matching user connects. Also in the *Plugins* menu.
+*Plugins → Connect Alarm Settings…*: per server, switch the alarm on, tick the groups someone must be in, and pick
+a WAV sound (with **Test**). When a matching user connects you hear the sound and get a clickable name in that
+server's tab. The window previews who online right now would match. *Connect Alarm: Toggle* flips it on/off.
+
+Each server has its own alarm (saved as `%APPDATA%\TS3Client\<server name>_alarm.cfg`). Chat commands still work:
+`/findgroup alarm set "Head Administrator" Guest`, `/findgroup alarm on|off|status|clear`.
 
 ## Meeting scheduler
 
@@ -48,6 +55,7 @@ Bind them in *Options → Hotkeys → Add → Plugins → Group Finder Plugin*:
 
 | Hotkey | Does |
 |---|---|
+| Open Find Users by Group | opens the group search window |
 | Open meeting scheduler | opens the list window |
 | Join next meeting now | moves/connects you to the next upcoming meeting right away |
 | Cancel pending meeting move | skips meetings being warned about or starting within 10 minutes (this time only) |

@@ -8,7 +8,7 @@
 
 #include "meetings/meetingdialog.h"
 #include "meetings/schedulerwindow.h"
-#include "meetings/ts3api.h"
+#include "common/ts3api.h"
 #include "meetings/warnpopup.h"
 #include "teamspeak/public_definitions.h"
 #include "teamspeak/public_errors.h"
@@ -32,26 +32,7 @@ MeetingController::~MeetingController()
     m_timer.stop();
     // Includes windows closed with WA_DeleteOnClose whose deferred delete hasn't run yet: after
     // ts3plugin_shutdown the DLL is unloaded, so nothing of ours may be left for the event loop.
-    for (const QPointer<QWidget>& w : m_owned)
-        delete w.data();
-}
-
-QWidget* MeetingController::dialogParent() const
-{
-    // Inside a modal dialog (ts3plugin_configure is called from TS3's Options) every window outside it is
-    // blocked, so open as its child; otherwise attach to TS3's main window.
-    if (QWidget* modal = QApplication::activeModalWidget())
-        return modal;
-    return ts3::mainWindow();
-}
-
-void MeetingController::own(QWidget* w)
-{
-    // Our windows must never count as "the application's last window": with TS3 minimized to the tray,
-    // closing one would otherwise quit TeamSpeak.
-    w->setAttribute(Qt::WA_QuitOnClose, false);
-    m_owned.erase(std::remove_if(m_owned.begin(), m_owned.end(), [](const QPointer<QWidget>& p) { return p.isNull(); }), m_owned.end());
-    m_owned << w;
+    m_windows.deleteAll();
 }
 
 void MeetingController::start()
@@ -272,10 +253,10 @@ bool MeetingController::onServerError(quint64 schid, const QString& message, uns
 
 void MeetingController::openScheduler()
 {
-    QWidget* parent = dialogParent();
+    QWidget* parent = gf::dialogParent();
     if (!m_window) {
         auto* w = new SchedulerWindow(this, parent);
-        own(w);
+        m_windows.own(w);
         m_window = w;
     } else if (QApplication::activeModalWidget() && parent != m_window && !parent->isAncestorOf(m_window)) {
         m_window->setParent(parent, m_window->windowFlags());  // already open, but now behind a modal dialog
@@ -321,9 +302,9 @@ void MeetingController::openMeetingDialog(const Meeting& m, bool isNew)
         m_dialog->activateWindow();
         return;
     }
-    QWidget* parent = (m_window && m_window->isVisible()) ? m_window.data() : dialogParent();
+    QWidget* parent = (m_window && m_window->isVisible()) ? m_window.data() : gf::dialogParent();
     auto* dlg = new MeetingDialog(m, isNew, parent);
-    own(dlg);
+    m_windows.own(dlg);
     m_dialog = dlg;
     connect(dlg, &QDialog::accepted, this, [this, dlg] { upsertMeeting(dlg->result()); });
     dlg->open();
@@ -345,9 +326,9 @@ void MeetingController::addMeetingFromCurrentTab()
         auto* box = new QMessageBox(QMessageBox::Information, QStringLiteral("Add meeting"),
                                     QStringLiteral("Connect to the meeting's server first — then right-click a channel and choose "
                                                    "<b>Add meeting here…</b>, or click <b>Add…</b> again."),
-                                    QMessageBox::Ok, m_window ? m_window.data() : dialogParent());
+                                    QMessageBox::Ok, m_window ? m_window.data() : gf::dialogParent());
         box->setAttribute(Qt::WA_DeleteOnClose);
-        own(box);
+        m_windows.own(box);
         box->open();
         return;
     }
@@ -364,7 +345,7 @@ void MeetingController::showWarning(const Meeting& m)
 {
     const QString id = m.id;
     auto* popup = new WarnPopup(m, m_occ.value(id).startUtc);  // top-level: must show even if TS3 is minimized
-    own(popup);
+    m_windows.own(popup);
     m_popups[id] = popup;
     connect(popup, &WarnPopup::moveNowClicked, this, [this, id] {
         m_occ[id].done = true;

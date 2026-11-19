@@ -1,4 +1,4 @@
-#include "meetings/ts3api.h"
+#include "common/ts3api.h"
 
 #include <QApplication>
 #include <QFile>
@@ -82,6 +82,47 @@ QVector<ServerTab> connectedServers()
             out << *t;
     F->freeMemory(ids);
     return out;
+}
+
+QVector<ClientEntry> clients(quint64 schid)
+{
+    QVector<ClientEntry> out;
+    anyID* ids = nullptr;
+    if (!F || F->getClientList(schid, &ids) != ERROR_ok || !ids)
+        return out;
+    for (size_t i = 0; ids[i]; ++i) {
+        ClientEntry c;
+        c.clid = ids[i];
+        char* s = nullptr;
+        if (F->getClientVariableAsString(schid, c.clid, CLIENT_NICKNAME, &s) == ERROR_ok)
+            c.nickname = take(s);
+        s = nullptr;
+        if (F->getClientVariableAsString(schid, c.clid, CLIENT_UNIQUE_IDENTIFIER, &s) == ERROR_ok)
+            c.uid = take(s);
+        s = nullptr;
+        if (F->getClientVariableAsString(schid, c.clid, CLIENT_SERVERGROUPS, &s) == ERROR_ok)
+            c.groupsCsv = take(s);
+        uint64 ch = 0;
+        if (F->getChannelOfClient(schid, c.clid, &ch) == ERROR_ok)
+            c.channelId = ch;
+        out << c;
+    }
+    F->freeMemory(ids);
+    return out;
+}
+
+QString channelName(quint64 schid, quint64 channelId)
+{
+    char* s = nullptr;
+    if (!F || F->getChannelVariableAsString(schid, channelId, CHANNEL_NAME, &s) != ERROR_ok)
+        return QString();
+    return take(s);
+}
+
+void requestServerGroups(quint64 schid)
+{
+    if (F)
+        F->requestServerGroupList(schid, nullptr);
 }
 
 QVector<ChannelEntry> channels(quint64 schid)

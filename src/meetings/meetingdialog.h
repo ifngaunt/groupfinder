@@ -4,7 +4,7 @@
 #include <QVector>
 
 #include "meetings/meeting.h"
-#include "meetings/ts3api.h"
+#include "common/ts3api.h"
 
 class QCheckBox;
 class QComboBox;

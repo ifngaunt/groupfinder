@@ -8,16 +8,20 @@
 // pointer and crashes the harness loudly.
 #include <QAbstractButton>
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
 #include <QSettings>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QPushButton>
 #include <QTableWidget>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QFile>
+#include <QKeyEvent>
 #include <QTemporaryDir>
 #include <QTimeZone>
 #include <QThread>
@@ -85,6 +89,22 @@ void pump(int ms)
     }
 }
 
+// Pump events until cond() holds (or timeoutMs passes) — robust against slow first-time work such as
+// Qt loading the font database when the first window is drawn.
+template <class Cond>
+bool waitFor(Cond cond, int timeoutMs = 5000)
+{
+    QElapsedTimer t;
+    t.start();
+    while (!cond()) {
+        if (t.elapsed() > timeoutMs)
+            return false;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(5);
+    }
+    return true;
+}
+
 QWidget* findVisible(const QString& objectName)
 {
     for (QWidget* w : QApplication::topLevelWidgets())
@@ -124,6 +144,33 @@ const QVector<FakeChannel> kChannels = {
     {12, 11, 0, QStringLiteral("Briefing")},
     {13, 0, 11, QStringLiteral("AFK")},
 };
+struct FakeClient {
+    anyID   clid;
+    QString nick, uid, groups;
+    uint64  channel;
+};
+const QVector<FakeClient> kClients = {
+    {5, QStringLiteral("HarnessUser"), QStringLiteral("harnessUID="), QStringLiteral("6"), 10},
+    {7, QStringLiteral("Alice"), QStringLiteral("aliceUID="), QStringLiteral("6,62"), 12},
+    {8, QStringLiteral("Bob"), QStringLiteral("bobUID="), QStringLiteral("62"), 13},
+    {9, QStringLiteral("Carol"), QStringLiteral("carolUID="), QStringLiteral("10"), 10},
+};
+const QVector<QPair<uint64, QString>> kGroups = {
+    {6, QStringLiteral("Guest")}, {62, QStringLiteral("Head Administrator")}, {9, QStringLiteral("Admin")}, {10, QStringLiteral("Admin")}};
+const FakeClient* client(anyID clid)
+{
+    for (const auto& c : kClients)
+        if (c.clid == clid)
+            return &c;
+    return nullptr;
+}
+// Plugin callbacks the fake client calls back into asynchronously (set while a plugin is loaded).
+void (*g_onGroup)(uint64, uint64, const char*, int, int, int) = nullptr;
+void (*g_onGroupsDone)(uint64)                                = nullptr;
+int  groupListRequests                                        = 0;
+QVector<QPair<uint64, QString>> g_extraGroups;  // extra server groups for a single mode
+QString lastSound;
+
 QVector<FakeServer> servers;
 QVector<Move>       moves;
 QVector<Connect>    connects;
@@ -223,9 +270,16 @@ unsigned int f_getClientID(uint64 schid, anyID* r)
 }
 unsigned int f_getChannelOfClient(uint64 schid, anyID clid, uint64* r)
 {
-    if (!connected(schid) || clid != kSelf)
+    if (!connected(schid))
         return ERROR_not_connected;
-    *r = server(schid)->selfChannel;
+    if (clid == kSelf) {
+        *r = server(schid)->selfChannel;
+        return ERROR_ok;
+    }
+    const FakeClient* c = client(clid);
+    if (!c)
+        return ERROR_not_connected;
+    *r = c->channel;
     return ERROR_ok;
 }
 unsigned int f_getChannelList(uint64 schid, uint64** r)
@@ -329,20 +383,42 @@ void f_printMessageToCurrentTab(const char* m)
 unsigned int f_playWaveFile(uint64, const char* path)
 {
     ++sounds;
+    lastSound = QString::fromUtf8(path);
     logLine(QStringLiteral("[ts3] playWaveFile ") + QString::fromUtf8(path));
     return ERROR_ok;
 }
-unsigned int f_requestServerGroupList(uint64, const char*) { return ERROR_ok; }
-unsigned int f_getClientList(uint64, anyID** r)
+unsigned int f_requestServerGroupList(uint64 schid, const char*)
 {
-    *r = static_cast<anyID*>(malloc(sizeof(anyID) * 2));
-    (*r)[0] = kSelf;
-    (*r)[1] = 0;
+    ++groupListRequests;
+    // Like TS3: the list arrives later, one onServerGroupListEvent per group, then ...FinishedEvent.
+    // May be called from any thread (e.g. a connect callback), so schedule the reply on the main thread.
+    QMetaObject::invokeMethod(qApp, [schid] {
+        QTimer::singleShot(10, [schid] {
+            if (!g_onGroup || !g_onGroupsDone || !connected(schid))
+                return;
+            for (const auto& g : kGroups + g_extraGroups)
+                g_onGroup(schid, g.first, g.second.toUtf8().constData(), 1, 0, 1);
+            g_onGroupsDone(schid);
+        });
+    }, Qt::QueuedConnection);
     return ERROR_ok;
 }
-unsigned int f_getClientVariableAsString(uint64, anyID, size_t flag, char** r)
+unsigned int f_getClientList(uint64 schid, anyID** r)
 {
-    *r = dup(flag == CLIENT_SERVERGROUPS ? QStringLiteral("6") : flag == CLIENT_NICKNAME ? QStringLiteral("HarnessUser") : QStringLiteral("harnessUID="));
+    if (!connected(schid))
+        return ERROR_not_connected;
+    *r = static_cast<anyID*>(malloc(sizeof(anyID) * size_t(kClients.size() + 1)));
+    for (int i = 0; i < kClients.size(); ++i)
+        (*r)[i] = kClients[i].clid;
+    (*r)[kClients.size()] = 0;
+    return ERROR_ok;
+}
+unsigned int f_getClientVariableAsString(uint64, anyID clid, size_t flag, char** r)
+{
+    const FakeClient* c = client(clid);
+    if (!c)
+        return ERROR_not_connected;
+    *r = dup(flag == CLIENT_SERVERGROUPS ? c->groups : flag == CLIENT_NICKNAME ? c->nick : c->uid);
     return ERROR_ok;
 }
 
@@ -410,12 +486,16 @@ struct Plugin {
         CHECK(h, QStringLiteral("LoadLibrary failed, error %1").arg(GetLastError()));
         sym<SetFns>("ts3plugin_setFunctionPointers")(fakeFunctions());
         CHECK(sym<IntFn>("ts3plugin_init")() == 0, "ts3plugin_init failed");
+        g_onGroup      = sym<void (*)(uint64, uint64, const char*, int, int, int)>("ts3plugin_onServerGroupListEvent");
+        g_onGroupsDone = sym<void (*)(uint64)>("ts3plugin_onServerGroupListFinishedEvent");
         sym<RegId>("ts3plugin_registerPluginID")("harness.plugin.id");
         pump(300);
     }
     void hotkey(const char* keyword) { sym<OnHotkey>("ts3plugin_onHotkeyEvent")(keyword); }
     void unload()
     {
+        g_onGroup      = nullptr;
+        g_onGroupsDone = nullptr;
         sym<VoidFn>("ts3plugin_shutdown")();
         pump(50);
         for (QWidget* w : QApplication::allWidgets())
@@ -434,8 +514,11 @@ void resetWorld()
     moves.clear();
     connects.clear();
     prints.clear();
-    sounds       = 0;
-    currentSchid = 1;
+    sounds            = 0;
+    lastSound.clear();
+    groupListRequests = 0;
+    g_extraGroups.clear();
+    currentSchid      = 1;
 }
 
 QString iniPath() { return QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("groupfinder_meetings.ini")); }
@@ -505,8 +588,8 @@ void modeLifecycle(const QString& dll)
         freeMem(hk);
     }
     logLine(QStringLiteral("hotkeys: %1").arg(nHotkeys));
-    CHECK(nMenus == 4, QStringLiteral("expected 4 menu items, got %1").arg(nMenus));
-    CHECK(nHotkeys == 5, QStringLiteral("expected 5 hotkeys, got %1").arg(nHotkeys));
+    CHECK(nMenus == 5, QStringLiteral("expected 5 menu items, got %1").arg(nMenus));
+    CHECK(nHotkeys == 6, QStringLiteral("expected 6 hotkeys, got %1").arg(nHotkeys));
 
     prints.clear();
     p.hotkey("gf_alarm_toggle");
@@ -809,6 +892,219 @@ void modeModal(const QString& dll)
     p.unload();
 }
 
+void modeAlarm(const QString& dll)
+{
+    // Alarm settings are per server: an alarm set on one tab must not fire for joins on another.
+    resetWorld();
+    servers << FakeServer{2, STATUS_CONNECTION_ESTABLISHED, QStringLiteral("Other Server"), QStringLiteral("UID2"), QStringLiteral("other.example.com"), 9987, 10};
+    Plugin p;
+    p.load(dll);
+    auto onConnect = p.sym<OnConnect>("ts3plugin_onConnectStatusChangeEvent");
+    auto cmd       = p.sym<ProcCmd>("ts3plugin_processCommand");
+    auto onMove    = p.sym<void (*)(uint64, anyID, uint64, uint64, int, const char*)>("ts3plugin_onClientMoveEvent");
+    onConnect(1, STATUS_CONNECTION_ESTABLISHED, 0);
+    onConnect(2, STATUS_CONNECTION_ESTABLISHED, 0);
+    pump(100);
+    pump(200);  // both servers' group lists arrive (server 2 connected last)
+    cmd(1, "alarm set \"Head Administrator\"");  // by name: needs server 1's group list, not server 2's
+    cmd(1, "alarm on");
+
+    onMove(2, 7, 0, 10, ENTER_VISIBILITY, "");  // Alice (groups 6,62) joins server 2
+    CHECK(sounds == 0, "server 1's alarm fired for a join on server 2");
+    onMove(1, 7, 0, 10, ENTER_VISIBILITY, "");  // ... and server 1
+    CHECK(sounds == 1, QStringLiteral("alarm did not fire on its own server (%1 sounds)").arg(sounds));
+    onMove(1, 9, 0, 10, ENTER_VISIBILITY, "");  // Carol (group 10) doesn't match
+    CHECK(sounds == 1, "alarm fired for a non-matching user");
+    prints.clear();
+    cmd(1, "\"Head Administrator\"");  // /findgroup by name on the tab that connected first
+    CHECK(prints.join(QLatin1Char('\n')).contains(QLatin1String("Found 2 user(s)")), "/findgroup by name failed on server 1: " + prints.join(QLatin1Char('|')));
+
+    // Server 2 gets its own alarm with a custom sound (file written by an older/other session).
+    const QString wav = QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("custom.wav"));
+    QFile(wav).open(QIODevice::WriteOnly);
+    {
+        QFile f(QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("Other Server_alarm.cfg")));
+        CHECK(f.open(QIODevice::WriteOnly), "cannot write alarm cfg");
+        f.write(QStringLiteral("enabled=1\nquery=62\nsound=%1\n").arg(QDir::toNativeSeparators(wav)).toUtf8());
+    }
+    onConnect(2, STATUS_CONNECTION_ESTABLISHED, 0);  // reconnect reloads that server's settings
+    onMove(2, 8, 0, 10, ENTER_VISIBILITY, "");      // Bob (62) joins server 2
+    CHECK(sounds == 2, "server 2's own alarm did not fire");
+    CHECK(QDir::fromNativeSeparators(lastSound) == QDir::fromNativeSeparators(wav), "custom alarm sound not used: " + lastSound);
+    // server 1 still uses its own settings (default sound)
+    onMove(1, 8, 0, 10, ENTER_VISIBILITY, "");
+    CHECK(sounds == 3 && lastSound.endsWith(QLatin1String("default.wav")), "server 1 lost its alarm or sound: " + lastSound);
+    p.unload();
+}
+
+QListWidgetItem* groupItem(QListWidget* list, const QString& name)
+{
+    for (int i = 0; i < list->count(); ++i)
+        if (list->item(i)->data(Qt::UserRole + 1).toString() == name)
+            return list->item(i);
+    fail("group not listed: " + name);
+}
+
+QStringList ticked(QListWidget* list)
+{
+    QStringList out;
+    for (int i = 0; i < list->count(); ++i)
+        if (list->item(i)->checkState() == Qt::Checked)
+            out << list->item(i)->data(Qt::UserRole + 1).toString();
+    return out;
+}
+
+void modeQuery(const QString& dll, const QString& out)
+{
+    resetWorld();
+    Plugin p;
+    p.load(dll);  // no connect event: as if the plugin was enabled mid-session (no group list cached yet)
+    auto onMenu = p.sym<OnMenu>("ts3plugin_onMenuItemEvent");
+    auto cmd    = p.sym<ProcCmd>("ts3plugin_processCommand");
+    auto onMove = p.sym<void (*)(uint64, anyID, uint64, uint64, int, const char*)>("ts3plugin_onClientMoveEvent");
+
+    // --- Find Users window
+    onMenu(1, PLUGIN_MENU_TYPE_GLOBAL, 1005, 0);
+    CHECK(waitFor([] { return findVisible(QStringLiteral("gfFinderWindow")) != nullptr; }), "Find Users window not opened by Plugins menu item 1005");
+    QWidget* finder = findVisible(QStringLiteral("gfFinderWindow"));
+    CHECK(groupListRequests >= 1, "window did not request the server's group list");
+    auto* groups = child<QListWidget>(finder, "gfGroupList");
+    waitFor([groups] { return groups->count() == 3; });
+    CHECK(groups->count() == 3, QStringLiteral("expected 3 groups (Admin, Guest, Head Administrator), got %1").arg(groups->count()));
+    auto* results = child<QTableWidget>(finder, "gfResultTable");
+
+    groupItem(groups, QStringLiteral("Head Administrator"))->setCheckState(Qt::Checked);
+    pump(200);
+    CHECK(results->rowCount() == 2, QStringLiteral("Head Administrator: expected Alice+Bob, got %1 rows").arg(results->rowCount()));
+    groupItem(groups, QStringLiteral("Guest"))->setCheckState(Qt::Checked);
+    pump(200);
+    CHECK(results->rowCount() == 1 && results->item(0, 0)->text() == QLatin1String("Alice"), "Head Administrator + Guest: expected only Alice");
+    grab(finder, out, QStringLiteral("finder"));
+
+    prints.clear();
+    child<QPushButton>(finder, "gfShowInChatButton")->click();
+    pump(100);
+    CHECK(prints.join(QLatin1Char('\n')).contains(QLatin1String("[URL=client://7/aliceUID=]Alice[/URL]")), "Show in chat did not print a clickable Alice");
+
+    // --- Set as connect alarm -> alarm window prefilled with the ticked groups
+    child<QPushButton>(finder, "gfUseAsAlarmButton")->click();
+    waitFor([] { return findVisible(QStringLiteral("gfAlarmWindow")) != nullptr; });
+    QWidget* alarm = findVisible(QStringLiteral("gfAlarmWindow"));
+    CHECK(alarm, "alarm window not opened from the finder");
+    finder->close();  // closing Find Users must not take the alarm window (and its edits) with it
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);  // as TS3's event loop would
+    pump(200);
+    CHECK(findVisible(QStringLiteral("gfAlarmWindow")), "closing Find Users closed the alarm window");
+    alarm = findVisible(QStringLiteral("gfAlarmWindow"));
+    {
+        auto* filter = child<QLineEdit>(alarm, "gfAlarmGroupFilter");
+        filter->setFocus();
+        filter->setText(QStringLiteral("Gue"));
+        QKeyEvent press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        QCoreApplication::sendEvent(filter, &press);
+        pump(200);
+        CHECK(findVisible(QStringLiteral("gfAlarmWindow")), "Enter in the group filter saved and closed the alarm window");
+        filter->clear();
+    }
+    auto* alarmGroups = child<QListWidget>(alarm, "gfAlarmGroupList");
+    CHECK(ticked(alarmGroups) == (QStringList{"Guest", "Head Administrator"}), "alarm window not prefilled: " + ticked(alarmGroups).join(','));
+    CHECK(child<QCheckBox>(alarm, "gfAlarmEnabled")->isChecked(), "alarm not enabled by 'Set as connect alarm'");
+    const QString wav = QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("ding.wav"));
+    QFile(wav).open(QIODevice::WriteOnly);
+    child<QLineEdit>(alarm, "gfAlarmSoundEdit")->setText(QDir::toNativeSeparators(wav));
+    grab(alarm, out, QStringLiteral("alarm-window"));
+    child<QPushButton>(alarm, "gfAlarmSaveButton")->click();
+    pump(300);
+    CHECK(!findVisible(QStringLiteral("gfAlarmWindow")), "alarm window still open after Save");
+
+    prints.clear();
+    cmd(1, "alarm status");
+    const QString status = prints.join(QLatin1Char('\n'));
+    CHECK(status.contains(QLatin1String("ENABLED")) && status.contains(QLatin1String("Head Administrator")) && status.contains(QLatin1String("Guest")),
+          "alarm not saved: " + status);
+    onMove(1, 8, 0, 10, ENTER_VISIBILITY, "");  // Bob: Head Administrator only -> no
+    CHECK(sounds == 0, "alarm fired for Bob (not a Guest)");
+    onMove(1, 7, 0, 10, ENTER_VISIBILITY, "");  // Alice: both -> alarm with the chosen sound
+    CHECK(sounds == 1 && QDir::fromNativeSeparators(lastSound) == QDir::fromNativeSeparators(wav), "alarm did not play the chosen sound: " + lastSound);
+
+    // --- Reopening the alarm window shows what was saved
+    onMenu(1, PLUGIN_MENU_TYPE_GLOBAL, 1002, 0);
+    waitFor([] { return findVisible(QStringLiteral("gfAlarmWindow")) != nullptr; });
+    alarm = findVisible(QStringLiteral("gfAlarmWindow"));
+    CHECK(alarm, "alarm window not opened by Plugins menu item 1002");
+    CHECK(ticked(child<QListWidget>(alarm, "gfAlarmGroupList")) == (QStringList{"Guest", "Head Administrator"}), "saved alarm groups not shown");
+    p.unload();
+}
+
+void modeLimits(const QString& dll)
+{
+    // Long group names and long /findgroup input must never terminate TeamSpeak (no sprintf_s/strcpy_s aborts).
+    resetWorld();
+    const QString longName(120, QLatin1Char('L'));
+    g_extraGroups = {{77, longName}, {78, QString(200, QLatin1Char('X'))}};  // 200 > the plugin's 128-byte name slot
+    Plugin p;
+    p.load(dll);
+    auto cmd = p.sym<ProcCmd>("ts3plugin_processCommand");
+    p.sym<OnConnect>("ts3plugin_onConnectStatusChangeEvent")(1, STATUS_CONNECTION_ESTABLISHED, 0);
+    waitFor([] { return false; }, 300);  // group list arrives (incl. the 200-char name)
+    prints.clear();
+    cmd(1, "77 77 77 77 77");  // header with five 120-char names
+    CHECK(prints.join(QLatin1Char('\n')).contains(QLatin1String("Found")), "no /findgroup output for long group names");
+    prints.clear();
+    const QByteArray longToken(300, 'Z');
+    cmd(1, longToken.constData());  // unknown 300-char name
+    CHECK(prints.join(QLatin1Char('\n')).contains(QLatin1String("No matching")), "no message for a long unknown token");
+    cmd(1, "alarm set 77 77 77 77 77");
+    cmd(1, "alarm on");
+    p.hotkey("gf_find_alarm");  // runs the long alarm criteria as /findgroup
+    pump(100);
+    p.unload();
+}
+
+void modeUnicode(const QString& dll)
+{
+    // Plugin installed under a non-ASCII path (e.g. a Windows user "Jörg") and a non-ASCII custom sound.
+    resetWorld();
+    QTemporaryDir root;
+    const QString dir = QDir(root.path()).filePath(QStringLiteral("Jörg ø"));
+    CHECK(QDir().mkpath(dir + QStringLiteral("/groupfinder/sound")), "cannot create unicode dir");
+    const QString srcDir = QFileInfo(dll).absolutePath();
+    CHECK(QFile::copy(dll, dir + QStringLiteral("/groupfinder.dll")), "cannot copy DLL");
+    CHECK(QFile::copy(srcDir + QStringLiteral("/groupfinder/sound/default.wav"), dir + QStringLiteral("/groupfinder/sound/default.wav")),
+          "cannot copy default.wav");
+    {
+        Plugin p;
+        p.load(dir + QStringLiteral("/groupfinder.dll"));
+        auto cmd    = p.sym<ProcCmd>("ts3plugin_processCommand");
+        auto onMove = p.sym<void (*)(uint64, anyID, uint64, uint64, int, const char*)>("ts3plugin_onClientMoveEvent");
+        cmd(1, "alarm set 62");
+        cmd(1, "alarm on");
+        onMove(1, 7, 0, 10, ENTER_VISIBILITY, "");  // default sound from the plugin's own (non-ASCII) folder
+        CHECK(sounds == 1, "no alarm sound with the plugin in a non-ASCII folder: " + prints.join(QLatin1Char('|')));
+        CHECK(QFile::exists(lastSound), "default sound path is not valid UTF-8 / does not exist: " + lastSound);
+        p.unload();
+    }
+    // A custom sound with a non-ASCII file name, as saved by the alarm window (UTF-8 in the cfg file).
+    resetWorld();
+    const QString wav = QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("dïng.wav"));
+    QFile(wav).open(QIODevice::WriteOnly);
+    {
+        QFile f(QDir(QString::fromUtf8(configDir)).filePath(QStringLiteral("Test Server_alarm.cfg")));
+        CHECK(f.open(QIODevice::WriteOnly), "cannot write alarm cfg");
+        f.write(QStringLiteral("enabled=1\nquery=62\nsound=%1\n").arg(wav).toUtf8());
+    }
+    {
+        Plugin p;
+        p.load(dll);
+        p.sym<OnConnect>("ts3plugin_onConnectStatusChangeEvent")(1, STATUS_CONNECTION_ESTABLISHED, 0);
+        pump(100);
+        p.sym<void (*)(uint64, anyID, uint64, uint64, int, const char*)>("ts3plugin_onClientMoveEvent")(1, 7, 0, 10, ENTER_VISIBILITY, "");
+        CHECK(sounds == 1 && QDir::fromNativeSeparators(lastSound) == QDir::fromNativeSeparators(wav),
+              "non-ASCII custom sound not played: " + lastSound + " | " + prints.join(QLatin1Char('|')));
+        p.unload();
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -848,6 +1144,14 @@ int main(int argc, char** argv)
             modeEdit(dll);
         else if (mode == QLatin1String("modal"))
             modeModal(dll);
+        else if (mode == QLatin1String("alarm"))
+            modeAlarm(dll);
+        else if (mode == QLatin1String("query"))
+            modeQuery(dll, out);
+        else if (mode == QLatin1String("limits"))
+            modeLimits(dll);
+        else if (mode == QLatin1String("unicode"))
+            modeUnicode(dll);
         else
             fail(QStringLiteral("unknown mode ") + mode);
 

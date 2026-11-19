@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QVector>
 
+#include "common/windowutil.h"
 #include "meetings/firing.h"
 #include "meetings/meeting.h"
 
@@ -57,8 +58,6 @@ private:
     void closeWarning(const QString& id);
     void openMeetingDialog(const Meeting& m, bool isNew);
     Meeting newMeetingFor(quint64 schid, quint64 channelId) const;
-    void own(QWidget* w);  // every window we create; deleted in the destructor if still alive
-    QWidget* dialogParent() const;  // active modal dialog (e.g. TS3 Options) if any, else TS3's main window
     const Meeting* find(const QString& id) const;
 
     QString                            m_iniPath, m_soundPath;
@@ -71,7 +70,7 @@ private:
     QPointer<QWidget>                  m_window;
     QPointer<QWidget>                  m_dialog;
     QHash<QString, QPointer<QWidget>>  m_popups;          // meeting id -> warning pop-up
-    QVector<QPointer<QWidget>>         m_owned;
+    WindowOwner                        m_windows;         // every window we create
 };
 
 } // namespace gf

@@ -27,13 +27,16 @@
 #include "teamspeak/public_rare_definitions.h"
 #include "ts3_functions.h"
 
+#include "gf_alarm.h"
 #include "gf_meetings.h"
+#include "gf_query.h"
 #include "plugin.h"
 
 /* ------------------------------ Small utilities ------------------------------ */
 #ifdef _WIN32
-#define _strcpy(dest, destSize, src) strcpy_s(dest, destSize, src)
-#define snprintf sprintf_s
+/* Truncate, never abort: strcpy_s/sprintf_s call the CRT invalid-parameter handler on overflow, which
+ * terminates TeamSpeak. (MSVC 2015+ snprintf is the standard, truncating one — no sprintf_s mapping.) */
+#define _strcpy(dest, destSize, src) strncpy_s(dest, destSize, src, _TRUNCATE)
 #else
 #define _strcpy(dest, destSize, src)                \
     {                                              \
@@ -63,24 +66,57 @@ typedef struct {
     int ready;
 } GroupCache;
 
-static GroupCache g_cache = {0};
+/* One cache per server tab: alarms and /findgroup name lookups on every tab need their own server's groups. */
+#define MAX_CACHED_SERVERS 8
+static GroupCache g_caches[MAX_CACHED_SERVERS];
 
-static void cache_reset(uint64 schid) { g_cache.schid = schid; g_cache.count = 0; g_cache.ready = 0; }
+static GroupCache* cache_for(uint64 schid) {
+    for (int i = 0; i < MAX_CACHED_SERVERS; ++i)
+        if (g_caches[i].schid == schid) return &g_caches[i];
+    return NULL;
+}
 
+/* Start an empty cache for schid (reusing its slot, a free one, or the first one if all are taken). */
+static GroupCache* cache_reset(uint64 schid) {
+    GroupCache* c = cache_for(schid);
+    for (int i = 0; !c && i < MAX_CACHED_SERVERS; ++i)
+        if (g_caches[i].schid == 0) c = &g_caches[i];
+    if (!c) c = &g_caches[0];
+    c->schid = schid; c->count = 0; c->ready = 0;
+    return c;
+}
+
+static void cache_forget(uint64 schid) {
+    GroupCache* c = cache_for(schid);
+    if (c) c->schid = 0;
+}
+
+/* Groups also arrive when someone else (e.g. the Find Users window) requests the list. */
 static void cache_add(uint64 schid, uint64 sgid, const char* name) {
-    if (g_cache.schid != schid) return;
-    for (size_t i = 0; i < g_cache.count; ++i)
-        if (g_cache.items[i].id == sgid) return;
-    if (g_cache.count >= MAX_GROUPS) return;
-    g_cache.items[g_cache.count].id = sgid;
-    _strcpy(g_cache.items[g_cache.count].name, sizeof(g_cache.items[g_cache.count].name), name ? name : "");
-    g_cache.count++;
+    GroupCache* c = cache_for(schid);
+    if (!c) c = cache_reset(schid);
+    for (size_t i = 0; i < c->count; ++i)
+        if (c->items[i].id == sgid) { /* refresh renamed groups */
+            _strcpy(c->items[i].name, sizeof(c->items[i].name), name ? name : "");
+            return;
+        }
+    if (c->count >= MAX_GROUPS) return;
+    c->items[c->count].id = sgid;
+    _strcpy(c->items[c->count].name, sizeof(c->items[c->count].name), name ? name : "");
+    c->count++;
+}
+
+/* The cache for schid if its group list has fully arrived, else NULL. */
+static const GroupCache* ready_cache(uint64 schid) {
+    const GroupCache* c = cache_for(schid);
+    return (c && c->ready) ? c : NULL;
 }
 
 static const char* resolve_group_name_by_id(uint64 schid, uint64 sgid) {
-    if (g_cache.schid != schid || !g_cache.ready) return NULL;
-    for (size_t i = 0; i < g_cache.count; ++i)
-        if (g_cache.items[i].id == sgid) return g_cache.items[i].name;
+    const GroupCache* c = ready_cache(schid);
+    if (!c) return NULL;
+    for (size_t i = 0; i < c->count; ++i)
+        if (c->items[i].id == sgid) return c->items[i].name;
     return NULL;
 }
 
@@ -169,15 +205,16 @@ static int build_groupsets_from_tokens(uint64 schid, char** tokens, int tokc, Gr
             const char* nm = resolve_group_name_by_id(schid, (uint64)v);
             gs.name = nm ? nm : tok;
         } else {
-            if (g_cache.schid != schid || !g_cache.ready) return -1;
+            const GroupCache* gc = ready_cache(schid);
+            if (!gc) return -1;
             int added_exact = 0;
-            for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
-                if (strcmp(g_cache.items[k].name, tok) == 0)
-                    gs.ids[gs.m++] = g_cache.items[k].id, added_exact = 1;
+            for (size_t k=0; k<gc->count && gs.m<16; ++k)
+                if (strcmp(gc->items[k].name, tok) == 0)
+                    gs.ids[gs.m++] = gc->items[k].id, added_exact = 1;
             if (!added_exact)
-                for (size_t k=0; k<g_cache.count && gs.m<16; ++k)
-                    if (icmp(g_cache.items[k].name, tok) == 0)
-                        gs.ids[gs.m++] = g_cache.items[k].id;
+                for (size_t k=0; k<gc->count && gs.m<16; ++k)
+                    if (icmp(gc->items[k].name, tok) == 0)
+                        gs.ids[gs.m++] = gc->items[k].id;
             if (gs.m == 0) return -2;
             gs.name = tok;
         }
@@ -187,9 +224,19 @@ static int build_groupsets_from_tokens(uint64 schid, char** tokens, int tokc, Gr
 }
 
 /* ------------------------------ Alarm state + persistence ------------------------------ */
-static int  g_alarm_enabled = 0;
-static char g_alarm_query[512] = {0};
-static char g_default_wav[PATH_BUFSIZE] = {0};
+/* One alarm config per server tab (schid), loaded from "<configPath>/<serverName>_alarm.cfg" on connect.
+ * Accessed from TS3's callback threads and from the Qt alarm window, so every access goes through
+ * alarm_get()/alarm_put() which copy under g_alarm_lock; file I/O and TS3 calls happen outside the lock. */
+#define MAX_ALARM_SLOTS 16
+
+typedef struct {
+    uint64        schid; /* 0 = free */
+    GfAlarmConfig cfg;
+} AlarmSlot;
+
+static AlarmSlot g_alarms[MAX_ALARM_SLOTS];
+static SRWLOCK   g_alarm_lock = SRWLOCK_INIT;
+static char      g_default_wav[PATH_BUFSIZE] = {0};
 
 /* Make "<configPath>/<serverName>_alarm.cfg" (serverName sanitized) */
 static void sanitize_filename(char* s) {
@@ -226,50 +273,147 @@ static void make_cfg_path_for_server(uint64 schid, char* out, size_t outsz) {
     }
 }
 
+/* Copy the value after "key=" (line ending stripped) into dst. */
+static void copy_cfg_value(const char* value, char* dst, size_t dstsz) {
+    size_t L = strlen(value);
+    while (L && (value[L - 1] == '\n' || value[L - 1] == '\r')) --L;
+    if (L >= dstsz) L = dstsz - 1;
+    memcpy(dst, value, L);
+    dst[L] = '\0';
+}
 
-/* Load per-server settings into globals */
-static void alarm_load_for_server(uint64 schid) {
+static void alarm_read_file(uint64 schid, GfAlarmConfig* cfg) {
     char path[PATH_BUFSIZE] = {0};
+    char line[PATH_BUFSIZE + 32];
+    FILE* f;
+    memset(cfg, 0, sizeof(*cfg));
     make_cfg_path_for_server(schid, path, sizeof(path));
-
-    g_alarm_enabled = 0; g_alarm_query[0] = '\0';
-
-    FILE* f = fopen(path, "r");
+    f = fopen(path, "r");
     if (!f) return;
-
-    char line[600];
     while (fgets(line, sizeof(line), f)) {
         if (!strncmp(line, "enabled=", 8)) {
-            int v=0; sscanf(line+8, "%d", &v); g_alarm_enabled = v?1:0;
+            int v = 0; sscanf(line + 8, "%d", &v); cfg->enabled = v ? 1 : 0;
         } else if (!strncmp(line, "query=", 6)) {
-            size_t L = strlen(line+6);
-            while (L && (line[6+L-1]=='\n' || line[6+L-1]=='\r')) --L;
-            if (L >= sizeof(g_alarm_query)) L = sizeof(g_alarm_query)-1;
-            memcpy(g_alarm_query, line+6, L); g_alarm_query[L] = '\0';
+            copy_cfg_value(line + 6, cfg->query, sizeof(cfg->query));
+        } else if (!strncmp(line, "sound=", 6)) {
+            copy_cfg_value(line + 6, cfg->sound, sizeof(cfg->sound));
         }
     }
     fclose(f);
 }
 
-/* Save current globals to this server's file */
-static void alarm_save_for_server(uint64 schid) {
+static void alarm_write_file(uint64 schid, const GfAlarmConfig* cfg) {
     char path[PATH_BUFSIZE] = {0};
+    FILE* f;
     make_cfg_path_for_server(schid, path, sizeof(path));
-    FILE* f = fopen(path, "w");
+    f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "enabled=%d\n", g_alarm_enabled ? 1 : 0);
-    fprintf(f, "query=%s\n", g_alarm_query);
+    fprintf(f, "enabled=%d\n", cfg->enabled ? 1 : 0);
+    fprintf(f, "query=%s\n", cfg->query);
+    fprintf(f, "sound=%s\n", cfg->sound);
     fclose(f);
 }
 
-static void alarm_print_status(uint64 schid) {
-    (void)schid;
-    char buf[700];
-    snprintf(buf, sizeof(buf), "[Alarm] %s  query: %s",
-             g_alarm_enabled ? "ENABLED" : "DISABLED",
-             g_alarm_query[0] ? g_alarm_query : "<not set>");
-    ts3Functions.printMessageToCurrentTab(buf);
+/* Store cfg for schid in memory (taking a free slot, or the oldest one if all are used). Caller holds the lock. */
+static void alarm_store_locked(uint64 schid, const GfAlarmConfig* cfg) {
+    int free_slot = -1;
+    for (int i = 0; i < MAX_ALARM_SLOTS; ++i) {
+        if (g_alarms[i].schid == schid) { g_alarms[i].cfg = *cfg; return; }
+        if (g_alarms[i].schid == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) free_slot = 0;
+    g_alarms[free_slot].schid = schid;
+    g_alarms[free_slot].cfg   = *cfg;
 }
+
+/* (Re)load schid's alarm from its file into memory. */
+static void alarm_load_for_server(uint64 schid) {
+    GfAlarmConfig cfg;
+    alarm_read_file(schid, &cfg);
+    AcquireSRWLockExclusive(&g_alarm_lock);
+    alarm_store_locked(schid, &cfg);
+    ReleaseSRWLockExclusive(&g_alarm_lock);
+}
+
+static void alarm_forget_server(uint64 schid) {
+    AcquireSRWLockExclusive(&g_alarm_lock);
+    for (int i = 0; i < MAX_ALARM_SLOTS; ++i)
+        if (g_alarms[i].schid == schid) g_alarms[i].schid = 0;
+    ReleaseSRWLockExclusive(&g_alarm_lock);
+}
+
+/* Copy of schid's alarm; loads it from disk the first time a tab is asked for. */
+static void alarm_get(uint64 schid, GfAlarmConfig* out) {
+    int found = 0;
+    AcquireSRWLockShared(&g_alarm_lock);
+    for (int i = 0; i < MAX_ALARM_SLOTS; ++i)
+        if (g_alarms[i].schid == schid) { *out = g_alarms[i].cfg; found = 1; break; }
+    ReleaseSRWLockShared(&g_alarm_lock);
+    if (!found) {
+        alarm_load_for_server(schid);
+        AcquireSRWLockShared(&g_alarm_lock);
+        memset(out, 0, sizeof(*out));
+        for (int i = 0; i < MAX_ALARM_SLOTS; ++i)
+            if (g_alarms[i].schid == schid) { *out = g_alarms[i].cfg; break; }
+        ReleaseSRWLockShared(&g_alarm_lock);
+    }
+}
+
+/* Replace schid's alarm and save it to that server's file. */
+static void alarm_put(uint64 schid, const GfAlarmConfig* cfg) {
+    AcquireSRWLockExclusive(&g_alarm_lock);
+    alarm_store_locked(schid, cfg);
+    ReleaseSRWLockExclusive(&g_alarm_lock);
+    alarm_write_file(schid, cfg);
+}
+
+/* Print to schid's tab (or the current tab when schid is 0). */
+static void print_to(uint64 schid, const char* msg) {
+    if (schid) ts3Functions.printMessage(schid, msg, PLUGIN_MESSAGE_TARGET_SERVER);
+    else ts3Functions.printMessageToCurrentTab(msg);
+}
+
+static void alarm_print_status(uint64 schid) {
+    GfAlarmConfig cfg;
+    char buf[PATH_BUFSIZE + 700];
+    alarm_get(schid, &cfg);
+    snprintf(buf, sizeof(buf), "[Alarm] %s  query: %s%s%s",
+             cfg.enabled ? "ENABLED" : "DISABLED",
+             cfg.query[0] ? cfg.query : "<not set>",
+             cfg.sound[0] ? "  sound: " : "", cfg.sound);
+    print_to(schid, buf);
+}
+
+static void alarm_toggle(uint64 schid) {
+    GfAlarmConfig cfg;
+    alarm_get(schid, &cfg);
+    cfg.enabled = !cfg.enabled;
+    alarm_put(schid, &cfg);
+    alarm_print_status(schid);
+}
+
+/* Does the UTF-8 path name an existing file? (narrow fopen would read it in the ANSI code page) */
+static int utf8_file_exists(const char* path) {
+    wchar_t wide[PATH_BUFSIZE];
+    DWORD attr;
+    if (!path || !path[0] || !MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, PATH_BUFSIZE)) return 0;
+    attr = GetFileAttributesW(wide);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* Plays `sound` (UTF-8; the plugin's default.wav when empty) on schid. Returns 0 if the file is missing. */
+static int alarm_play(uint64 schid, const char* sound) {
+    const char* path = (sound && sound[0]) ? sound : g_default_wav;
+    if (!utf8_file_exists(path)) return 0;
+    ts3Functions.playWaveFile(schid, path);
+    return 1;
+}
+
+/* ---- C API for the Qt alarm window (src/gf_alarm.h) ---- */
+void gf_alarm_get(uint64 schid, GfAlarmConfig* out) { alarm_get(schid, out); }
+void gf_alarm_set(uint64 schid, const GfAlarmConfig* cfg) { alarm_put(schid, cfg); alarm_print_status(schid); }
+int  gf_alarm_play(uint64 schid, const char* soundPath) { return alarm_play(schid, soundPath); }
+const char* gf_alarm_default_sound(void) { return g_default_wav; }
 
 /* ------------------------------ Plugin entry points ------------------------------ */
 
@@ -315,7 +459,8 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
-    gf_meetings_shutdown(); /* closes all meeting windows before the DLL unloads */
+    gf_query_shutdown();    /* close every plugin window before the DLL unloads */
+    gf_meetings_shutdown();
     if (pluginID) { free(pluginID); pluginID = NULL; }
 }
 
@@ -337,6 +482,7 @@ int ts3plugin_onServerErrorEvent(uint64 schid, const char* errorMessage, unsigne
 
 /* Bindable in TS3: Options -> Hotkeys -> Add -> Plugins -> Group Finder Plugin. */
 static const struct { const char* keyword; const char* description; } kHotkeys[] = {
+    {"gf_open_finder",   "Open Find Users by Group"},
     {"gf_open_meetings", "Open meeting scheduler"},
     {"gf_join_next",     "Join next meeting now"},
     {"gf_cancel_move",   "Cancel pending meeting move"},
@@ -360,18 +506,17 @@ void ts3plugin_onHotkeyEvent(const char* keyword) {
     uint64 schid;
     if (!keyword || gf_meetings_handle_hotkey(keyword)) return;
     schid = ts3Functions.getCurrentServerConnectionHandlerID();
-    if (strcmp(keyword, "gf_alarm_toggle") == 0) {
-        g_alarm_enabled = !g_alarm_enabled;
-        alarm_save_for_server(schid);
-        alarm_print_status(schid);
+    if (strcmp(keyword, "gf_open_finder") == 0) {
+        gf_query_open_finder();
+    } else if (strcmp(keyword, "gf_alarm_toggle") == 0) {
+        alarm_toggle(schid);
     } else if (strcmp(keyword, "gf_find_alarm") == 0) {
-        if (!g_alarm_query[0]) {
-            ts3Functions.printMessageToCurrentTab("[Alarm] No criteria set. Use /findgroup alarm set <groups...> first.");
-        } else {
-            char query[sizeof(g_alarm_query)];
-            _strcpy(query, sizeof(query), g_alarm_query);
-            ts3plugin_processCommand(schid, query); /* same output as typing /findgroup <criteria> */
-        }
+        GfAlarmConfig cfg;
+        alarm_get(schid, &cfg);
+        if (!cfg.query[0])
+            print_to(schid, "[Alarm] No criteria set. Use Plugins > Connect Alarm Settings... or /findgroup alarm set <groups...> first.");
+        else
+            ts3plugin_processCommand(schid, cfg.query); /* same output as typing /findgroup <criteria> */
     }
 }
 
@@ -384,11 +529,15 @@ void ts3plugin_registerPluginID(const char* id) {
     /* Derive asset dir from the DLL filename:
        .../TS3Client/plugins/<dllName>.dll  -> assets at .../TS3Client/plugins/<dllName>/sound/default.wav */
     char modPath[PATH_BUFSIZE] = {0};
+    wchar_t modPathW[PATH_BUFSIZE] = {0};
     HMODULE hmod = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+    /* Wide API + UTF-8: TS3 (playWaveFile) and the Qt code expect UTF-8, and the plugins folder is under the
+     * user profile, which may contain non-ASCII characters (e.g. C:\Users\Jörg). */
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)&ts3plugin_registerPluginID, &hmod)) {
-        if (GetModuleFileNameA(hmod, modPath, sizeof(modPath))) {
+                           (LPCWSTR)&ts3plugin_registerPluginID, &hmod)) {
+        if (GetModuleFileNameW(hmod, modPathW, PATH_BUFSIZE) &&
+            WideCharToMultiByte(CP_UTF8, 0, modPathW, -1, modPath, sizeof(modPath), NULL, NULL)) {
             char* lastSlash = strrchr(modPath, '\\'); if (!lastSlash) lastSlash = strrchr(modPath, '/');
             char dllDir[PATH_BUFSIZE] = {0};
             char dllName[PATH_BUFSIZE] = {0};
@@ -417,6 +566,7 @@ void ts3plugin_registerPluginID(const char* id) {
         char cfgDir[PATH_BUFSIZE] = {0};
         ts3Functions.getConfigPath(cfgDir, PATH_BUFSIZE);
         gf_meetings_init(&ts3Functions, pluginID, cfgDir, g_default_wav);
+        gf_query_init(&ts3Functions, pluginID);
     }
 }
 
@@ -427,11 +577,13 @@ const char* ts3plugin_commandKeyword() { return "findgroup"; }
 void ts3plugin_onConnectStatusChangeEvent(uint64 schid, int newStatus, unsigned int errorNumber) {
     (void)errorNumber;
     gf_meetings_on_connect_status(schid, newStatus);
+    gf_query_on_connect_status(schid, newStatus);
+    if (newStatus == STATUS_DISCONNECTED) { alarm_forget_server(schid); cache_forget(schid); }
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         cache_reset(schid);
         ts3Functions.requestServerGroupList(schid, NULL);
 
-        /* Load per-server alarm state (groupfinder_alarm_<serverUID>.cfg) */
+        /* Load this server's alarm (<server name>_alarm.cfg) */
         alarm_load_for_server(schid);
         alarm_print_status(schid);
     }
@@ -441,19 +593,23 @@ void ts3plugin_onConnectStatusChangeEvent(uint64 schid, int newStatus, unsigned 
 void ts3plugin_onServerGroupListEvent(uint64 schid, uint64 serverGroupID, const char* name, int type, int iconID, int saveDB) {
     (void)type; (void)iconID; (void)saveDB;
     cache_add(schid, serverGroupID, name ? name : "");
+    gf_query_on_group(schid, serverGroupID, name);
 }
 
 /* Mark cache ready */
 void ts3plugin_onServerGroupListFinishedEvent(uint64 schid) {
-    if (g_cache.schid == schid) g_cache.ready = 1;
+    GroupCache* c = cache_for(schid);
+    if (c) c->ready = 1;
+    gf_query_on_groups_done(schid);
 }
 
 /* ------------------------------ Menu scaffolding ------------------------------ */
 enum {
     MENU_ID_GLOBAL_ALARM_TOGGLE   = 1001,
-    MENU_ID_GLOBAL_ALARM_SETQUERY = 1002,
+    MENU_ID_GLOBAL_ALARM_SETTINGS = 1002, /* Plugins menu: Connect Alarm settings window */
     MENU_ID_GLOBAL_MEETINGS       = 1003, /* Plugins menu: open the meeting scheduler */
-    MENU_ID_CHANNEL_ADD_MEETING   = 1004  /* channel right-click: add a meeting for this channel */
+    MENU_ID_CHANNEL_ADD_MEETING   = 1004, /* channel right-click: add a meeting for this channel */
+    MENU_ID_GLOBAL_FIND_USERS     = 1005  /* Plugins menu: Find Users by Group window */
 };
 
 static struct PluginMenuItem* make_menu_item(enum PluginMenuType type, int id, const char* text) {
@@ -466,13 +622,14 @@ static struct PluginMenuItem* make_menu_item(enum PluginMenuType type, int id, c
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const size_t count = 4;
+    const size_t count = 5;
     struct PluginMenuItem** m = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
-    m[0] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_MEETINGS,       "Meeting Scheduler\u2026");
-    m[1] = make_menu_item(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_ADD_MEETING,   "Add meeting here\u2026");
+    m[0] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_FIND_USERS,     "Find Users by Group\u2026");
+    m[1] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_SETTINGS, "Connect Alarm Settings\u2026");
     m[2] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_TOGGLE,   "Connect Alarm: Toggle");
-    m[3] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_SETQUERY, "Connect Alarm: Set Criteria...");
-    m[4] = NULL;
+    m[3] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_MEETINGS,       "Meeting Scheduler\u2026");
+    m[4] = make_menu_item(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_ADD_MEETING,   "Add meeting here\u2026");
+    m[5] = NULL;
     *menuItems = m;
     *menuIcon = NULL;
 }
@@ -488,14 +645,13 @@ void ts3plugin_onMenuItemEvent(uint64 schid, enum PluginMenuType type, int menuI
             gf_meetings_open_scheduler();
             break;
         case MENU_ID_GLOBAL_ALARM_TOGGLE:
-            g_alarm_enabled = !g_alarm_enabled;
-            alarm_save_for_server(schid);
-            alarm_print_status(schid);
+            alarm_toggle(schid);
             break;
-        case MENU_ID_GLOBAL_ALARM_SETQUERY:
-            ts3Functions.printMessageToCurrentTab("[Alarm] Use: /findgroup alarm set <criteria tokens...>   e.g. /findgroup alarm set \"Head Administrator\" Guest");
-            ts3Functions.printMessageToCurrentTab("[Alarm] Or clear with: /findgroup alarm clear");
-            alarm_print_status(schid);
+        case MENU_ID_GLOBAL_ALARM_SETTINGS:
+            gf_query_open_alarm(schid);
+            break;
+        case MENU_ID_GLOBAL_FIND_USERS:
+            gf_query_open_finder();
             break;
         default: break;
     }
@@ -503,12 +659,14 @@ void ts3plugin_onMenuItemEvent(uint64 schid, enum PluginMenuType type, int menuI
 
 /* ------------------------------ Connect detection + alarm ------------------------------ */
 void ts3plugin_onClientMoveEvent(uint64 schid, anyID clid, uint64 oldChannelID, uint64 newChannelID, int visibility, const char* moveMessage) {
+    GfAlarmConfig cfg;
     (void)visibility; (void)moveMessage;
-    if (!g_alarm_enabled || !g_alarm_query[0]) return;
     if (oldChannelID != 0 || newChannelID == 0) return; /* only initial connect */
+    alarm_get(schid, &cfg);                              /* this server's alarm */
+    if (!cfg.enabled || !cfg.query[0]) return;
 
     /* Build GroupSet[] from stored query */
-    char** toks = NULL; int tokc = split_quoted_args(g_alarm_query, &toks);
+    char** toks = NULL; int tokc = split_quoted_args(cfg.query, &toks);
     if (tokc <= 0) { if (toks) free(toks); return; }
 
     GroupSet sets[32]; int sN = build_groupsets_from_tokens(schid, toks, tokc, sets, 32);
@@ -521,7 +679,7 @@ void ts3plugin_onClientMoveEvent(uint64 schid, anyID clid, uint64 oldChannelID, 
     ts3Functions.freeMemory(sgroups);
     if (!hit) return;
 
-    /* Print clickable client link */
+    /* Print clickable client link in this server's tab */
     {
         char* uid  = NULL;
         char* nick = NULL;
@@ -531,25 +689,19 @@ void ts3plugin_onClientMoveEvent(uint64 schid, anyID clid, uint64 oldChannelID, 
             snprintf(line, sizeof(line),
                     "[Alarm] Match: [URL=client://%u/%s]%s[/URL] — playing sound...",
                     (unsigned)clid, uid, nick);
-            ts3Functions.printMessageToCurrentTab(line);
+            print_to(schid, line);
         } else {
-            ts3Functions.printMessageToCurrentTab("[Alarm] Match detected, playing sound...");
+            print_to(schid, "[Alarm] Match detected, playing sound...");
         }
         if (uid)  ts3Functions.freeMemory(uid);
         if (nick) ts3Functions.freeMemory(nick);
     }
 
-
-    FILE* f = fopen(g_default_wav, "rb");
-    if (!f) {
+    if (!alarm_play(schid, cfg.sound)) {
         char msg[PATH_BUFSIZE + 64];
-        snprintf(msg, sizeof(msg), "[Alarm] WAV not found: %s", g_default_wav);
-        ts3Functions.printMessageToCurrentTab(msg);
-        return;
+        snprintf(msg, sizeof(msg), "[Alarm] WAV not found: %s", cfg.sound[0] ? cfg.sound : g_default_wav);
+        print_to(schid, msg);
     }
-    fclose(f);
-
-    ts3Functions.playWaveFile(schid, g_default_wav);
 }
 
 /* ------------------------------ Command implementation ------------------------------ */
@@ -571,29 +723,31 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
     int argc = split_quoted_args(command, &argv);
     if (argc <= 0) goto done;
 
-    /* Handle alarm subcommand */
+    /* Handle alarm subcommand (settings of this server tab) */
     if (icmp(argv[0], "alarm") == 0) {
-        if (argc >= 2 && icmp(argv[1], "on") == 0)  { g_alarm_enabled = 1; alarm_save_for_server(schid); alarm_print_status(schid); goto done; }
-        if (argc >= 2 && icmp(argv[1], "off") == 0) { g_alarm_enabled = 0; alarm_save_for_server(schid); alarm_print_status(schid); goto done; }
+        GfAlarmConfig cfg;
+        alarm_get(schid, &cfg);
+        if (argc >= 2 && icmp(argv[1], "on") == 0)  { cfg.enabled = 1; alarm_put(schid, &cfg); alarm_print_status(schid); goto done; }
+        if (argc >= 2 && icmp(argv[1], "off") == 0) { cfg.enabled = 0; alarm_put(schid, &cfg); alarm_print_status(schid); goto done; }
         if (argc >= 2 && icmp(argv[1], "status") == 0){ alarm_print_status(schid); goto done; }
-        if (argc >= 2 && icmp(argv[1], "clear") == 0) { g_alarm_query[0] = '\0'; alarm_save_for_server(schid); alarm_print_status(schid); goto done; }
+        if (argc >= 2 && icmp(argv[1], "clear") == 0) { cfg.query[0] = '\0'; alarm_put(schid, &cfg); alarm_print_status(schid); goto done; }
         if (argc >= 3 && icmp(argv[1], "set") == 0) {
-            g_alarm_query[0] = '\0';
+            cfg.query[0] = '\0';
             for (int i=2; i<argc; ++i) {
                 const char* tok = argv[i]; if (!tok) continue;
                 int need_quote = strchr(tok, ' ') != NULL;
-                size_t cur = strlen(g_alarm_query);
-                if (cur + strlen(tok) + 4 >= sizeof(g_alarm_query)) break;
-                if (cur) strncat(g_alarm_query, " ", sizeof(g_alarm_query)-cur-1);
+                size_t cur = strlen(cfg.query);
+                if (cur + strlen(tok) + 4 >= sizeof(cfg.query)) break;
+                if (cur) strncat(cfg.query, " ", sizeof(cfg.query)-cur-1);
                 if (need_quote) {
-                    strncat(g_alarm_query, "\"", sizeof(g_alarm_query)-strlen(g_alarm_query)-1);
-                    strncat(g_alarm_query, tok, sizeof(g_alarm_query)-strlen(g_alarm_query)-1);
-                    strncat(g_alarm_query, "\"", sizeof(g_alarm_query)-strlen(g_alarm_query)-1);
+                    strncat(cfg.query, "\"", sizeof(cfg.query)-strlen(cfg.query)-1);
+                    strncat(cfg.query, tok, sizeof(cfg.query)-strlen(cfg.query)-1);
+                    strncat(cfg.query, "\"", sizeof(cfg.query)-strlen(cfg.query)-1);
                 } else {
-                    strncat(g_alarm_query, tok, sizeof(g_alarm_query)-strlen(g_alarm_query)-1);
+                    strncat(cfg.query, tok, sizeof(cfg.query)-strlen(cfg.query)-1);
                 }
             }
-            alarm_save_for_server(schid);
+            alarm_put(schid, &cfg);
             alarm_print_status(schid);
             goto done;
         }
@@ -625,18 +779,19 @@ int ts3plugin_processCommand(uint64 schid, const char* command) {
             const char* nm = resolve_group_name_by_id(schid, (uint64)v);
             gs.name = nm ? nm : tok;
         } else {
-            if (g_cache.schid != schid || !g_cache.ready) {
+            const GroupCache* gc = ready_cache(schid);
+            if (!gc) {
                 ts3Functions.printMessageToCurrentTab("Group list not ready yet. Try again in a moment.");
                 goto done;
             }
             int added_exact = 0;
-            for (size_t k = 0; k < g_cache.count && gs.m < 16; ++k)
-                if (strcmp(g_cache.items[k].name, tok) == 0)
-                    gs.ids[gs.m++] = g_cache.items[k].id, added_exact = 1;
+            for (size_t k = 0; k < gc->count && gs.m < 16; ++k)
+                if (strcmp(gc->items[k].name, tok) == 0)
+                    gs.ids[gs.m++] = gc->items[k].id, added_exact = 1;
             if (!added_exact)
-                for (size_t k = 0; k < g_cache.count && gs.m < 16; ++k)
-                    if (icmp(g_cache.items[k].name, tok) == 0)
-                        gs.ids[gs.m++] = g_cache.items[k].id;
+                for (size_t k = 0; k < gc->count && gs.m < 16; ++k)
+                    if (icmp(gc->items[k].name, tok) == 0)
+                        gs.ids[gs.m++] = gc->items[k].id;
 
             if (gs.m == 0) {
                 char msg[256];
