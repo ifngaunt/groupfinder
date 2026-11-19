@@ -40,11 +40,6 @@ void gf_query_open_finder(void)
     post([](gf::QueryController* c) { c->openFinder(); });
 }
 
-void gf_query_open_alarm(uint64 schid)
-{
-    post([schid](gf::QueryController* c) { c->openAlarm(schid); });
-}
-
 void gf_query_on_group(uint64 schid, uint64 groupID, const char* name)
 {
     const QString n = QString::fromUtf8(name ? name : "");

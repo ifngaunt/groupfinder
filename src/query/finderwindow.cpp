@@ -67,7 +67,7 @@ FinderWindow::FinderWindow(QueryController* controller, QWidget* parent) : QDial
     m_chat->setObjectName(QStringLiteral("gfShowInChatButton"));
     m_toAlarm->setObjectName(QStringLiteral("gfUseAsAlarmButton"));
     m_chat->setToolTip(QStringLiteral("Print the results as clickable names in this server's chat tab"));
-    m_toAlarm->setToolTip(QStringLiteral("Play a sound whenever someone in all these groups connects to this server"));
+    // With groups ticked: make them this server's alarm. With none ticked: open the saved alarm as it is.
     auto* buttons = new QHBoxLayout;
     buttons->addWidget(m_chat);
     buttons->addWidget(m_toAlarm);
@@ -90,7 +90,7 @@ FinderWindow::FinderWindow(QueryController* controller, QWidget* parent) : QDial
     connect(m_chat, &QPushButton::clicked, this, &FinderWindow::showInChat);
     connect(m_toAlarm, &QPushButton::clicked, this, [this] {
         const QVector<GroupInfo> ticked = m_groups->tickedGroups();
-        m_c->openAlarm(currentSchid(), &ticked);
+        m_c->openAlarm(currentSchid(), ticked.isEmpty() ? nullptr : &ticked);
     });
     connect(close, &QPushButton::clicked, this, &QDialog::close);
 
@@ -164,7 +164,10 @@ void FinderWindow::refreshResults()
                              .arg(matches.size() == 1 ? QString() : QStringLiteral("s"))
                              .arg(m_groups->tickedNames().join(QStringLiteral(" + ")).toHtmlEscaped()));
     m_chat->setEnabled(!matches.isEmpty());
-    m_toAlarm->setEnabled(!ticked.isEmpty());
+    m_toAlarm->setEnabled(currentSchid() != 0);
+    m_toAlarm->setText(ticked.isEmpty() ? QStringLiteral("Connect alarm settings…") : QStringLiteral("Set as connect alarm…"));
+    m_toAlarm->setToolTip(ticked.isEmpty() ? QStringLiteral("View or change this server's connect alarm")
+                                           : QStringLiteral("Play a sound whenever someone in all ticked groups connects to this server"));
 }
 
 void FinderWindow::showInChat()

@@ -514,7 +514,7 @@ void ts3plugin_onHotkeyEvent(const char* keyword) {
         GfAlarmConfig cfg;
         alarm_get(schid, &cfg);
         if (!cfg.query[0])
-            print_to(schid, "[Alarm] No criteria set. Use Plugins > Connect Alarm Settings... or /findgroup alarm set <groups...> first.");
+            print_to(schid, "[Alarm] No criteria set. Use Plugins > Find Users by Group > Set as connect alarm, or /findgroup alarm set <groups...>.");
         else
             ts3plugin_processCommand(schid, cfg.query); /* same output as typing /findgroup <criteria> */
     }
@@ -606,7 +606,7 @@ void ts3plugin_onServerGroupListFinishedEvent(uint64 schid) {
 /* ------------------------------ Menu scaffolding ------------------------------ */
 enum {
     MENU_ID_GLOBAL_ALARM_TOGGLE   = 1001,
-    MENU_ID_GLOBAL_ALARM_SETTINGS = 1002, /* Plugins menu: Connect Alarm settings window */
+    /* 1002 (alarm settings) retired in 1.4.1: Find Users by Group opens the alarm window */
     MENU_ID_GLOBAL_MEETINGS       = 1003, /* Plugins menu: open the meeting scheduler */
     MENU_ID_CHANNEL_ADD_MEETING   = 1004, /* channel right-click: add a meeting for this channel */
     MENU_ID_GLOBAL_FIND_USERS     = 1005  /* Plugins menu: Find Users by Group window */
@@ -622,14 +622,13 @@ static struct PluginMenuItem* make_menu_item(enum PluginMenuType type, int id, c
 }
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    const size_t count = 5;
+    const size_t count = 4;
     struct PluginMenuItem** m = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
     m[0] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_FIND_USERS,     "Find Users by Group\u2026");
-    m[1] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_SETTINGS, "Connect Alarm Settings\u2026");
-    m[2] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_TOGGLE,   "Connect Alarm: Toggle");
-    m[3] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_MEETINGS,       "Meeting Scheduler\u2026");
-    m[4] = make_menu_item(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_ADD_MEETING,   "Add meeting here\u2026");
-    m[5] = NULL;
+    m[1] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_TOGGLE,   "Connect Alarm: Toggle");
+    m[2] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_MEETINGS,       "Meeting Scheduler\u2026");
+    m[3] = make_menu_item(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_ADD_MEETING,   "Add meeting here\u2026");
+    m[4] = NULL;
     *menuItems = m;
     *menuIcon = NULL;
 }
@@ -646,9 +645,6 @@ void ts3plugin_onMenuItemEvent(uint64 schid, enum PluginMenuType type, int menuI
             break;
         case MENU_ID_GLOBAL_ALARM_TOGGLE:
             alarm_toggle(schid);
-            break;
-        case MENU_ID_GLOBAL_ALARM_SETTINGS:
-            gf_query_open_alarm(schid);
             break;
         case MENU_ID_GLOBAL_FIND_USERS:
             gf_query_open_finder();

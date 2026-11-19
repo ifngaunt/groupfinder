@@ -59,7 +59,7 @@ slots and per-server group caches, both keyed by schid). Qt code: `src/meetings/
 
 | File | Role |
 |---|---|
-| `src/plugin.c` | exports; finder (`split_quoted_args`, `build_groupsets_from_tokens`, `client_matches_sets`); per-server alarm + group caches; menus 1001–1005; hotkeys table `kHotkeys`; forwards to both bridges |
+| `src/plugin.c` | exports; finder (`split_quoted_args`, `build_groupsets_from_tokens`, `client_matches_sets`); per-server alarm + group caches; menus 1001, 1003–1005; hotkeys table `kHotkeys`; forwards to both bridges |
 | `src/gf_meetings.h` / `meetings/gf_meetings.cpp` | C bridge. `init` creates `MeetingController` on Qt's GUI thread; every other entry point queues onto it (`QMetaObject::invokeMethod(..., Qt::QueuedConnection)`); `shutdown` deletes it (blocking-queued if off-thread) |
 | `meetings/schedule.*` | `Schedule` + `nextOccurrence()` (QTimeZone, DST-aware, DST gap → +1 h), `describeRepeat()` — pure, unit-tested |
 | `meetings/meeting.*` | `Meeting` struct, `MeetingStore` (INI via QSettings, `<TS3 config>/groupfinder_meetings.ini`), `splitChannelPath()` — pure, unit-tested |
@@ -71,8 +71,9 @@ slots and per-server group caches, both keyed by schid). Qt code: `src/meetings/
 | `meetings/meetingcontroller.*` | 1 s tick applying `decide()`; execute = move if connected to server UID (fallback host:port) else `guiConnect` + move after `STATUS_CONNECTION_ESTABLISHED`; owns all windows (`own()`), deletes them in its destructor |
 | `meetings/schedulerwindow.*`, `meetingdialog.*`, `warnpopup.*` | Qt UI. Non-blocking only (`show()`/`open()`, never `exec()`). Warning pop-up is parentless + stays-on-top |
 
-Menus: 1005 Find Users by Group…, 1002 Connect Alarm Settings…, 1001 Connect Alarm: Toggle, 1003 Meeting
-Scheduler… (all GLOBAL), 1004 Add meeting here… (CHANNEL). Hotkeys: `gf_open_finder`, `gf_open_meetings`,
+Menus: 1005 Find Users by Group…, 1001 Connect Alarm: Toggle, 1003 Meeting Scheduler… (all GLOBAL), 1004 Add
+meeting here… (CHANNEL). 1002 (Connect Alarm Settings…) was retired in 1.4.1 — the alarm window opens from Find
+Users ("Set as connect alarm…" with groups ticked, "Connect alarm settings…" with none). Hotkeys: `gf_open_finder`, `gf_open_meetings`,
 `gf_join_next`, `gf_cancel_move`, `gf_alarm_toggle`, `gf_find_alarm`. `ts3plugin_configure` (Settings button)
 opens the scheduler.
 
@@ -108,7 +109,7 @@ opens the scheduler.
 - `tests/test_*.cpp` (QtTest, one exe `gf_tests`): schedule math incl. DST, store round-trip/garbage, firing rules.
 - `tests/plugin_harness.cpp` (`gf_harness <dll> <mode> <outdir>`): loads the real DLL with a fake
   `TS3Functions` (one server "Test Server"/UID1, channels Lobby/Ops/Ops→Briefing/AFK, self clid 5) and checks
-  exports, menus (5), hotkeys (6), move/connect/not-found paths, warn pop-up countdown + buttons, calls from a
+  exports, menus (4), hotkeys (6), move/connect/not-found paths, warn pop-up countdown + buttons, calls from a
   worker thread, clean unload (asserts the DLL is really unmapped), edit/save + Qt settings cache after unload,
   opening from inside a modal dialog, per-server alarms (`alarm`), both query windows end to end (`query`), long
   names/input (`limits`), non-ASCII plugin folder + sound (`unicode`), and that closing our windows never emits

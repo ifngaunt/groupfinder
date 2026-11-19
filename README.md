@@ -27,7 +27,8 @@ Or type it in a chat tab:
 
 ## Connect alarm
 
-*Plugins → Connect Alarm Settings…*: per server, switch the alarm on, tick the groups someone must be in, and pick
+In *Find Users by Group*, tick groups and click **Set as connect alarm…** (or, with nothing ticked, **Connect alarm
+settings…** to see the saved one): per server, switch the alarm on, tick the groups someone must be in, and pick
 a WAV sound (with **Test**). When a matching user connects you hear the sound and get a clickable name in that
 server's tab. The window previews who online right now would match. *Connect Alarm: Toggle* flips it on/off.
 

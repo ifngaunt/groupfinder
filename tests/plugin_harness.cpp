@@ -588,7 +588,7 @@ void modeLifecycle(const QString& dll)
         freeMem(hk);
     }
     logLine(QStringLiteral("hotkeys: %1").arg(nHotkeys));
-    CHECK(nMenus == 5, QStringLiteral("expected 5 menu items, got %1").arg(nMenus));
+    CHECK(nMenus == 4, QStringLiteral("expected 4 menu items, got %1").arg(nMenus));
     CHECK(nHotkeys == 6, QStringLiteral("expected 6 hotkeys, got %1").arg(nHotkeys));
 
     prints.clear();
@@ -1027,11 +1027,21 @@ void modeQuery(const QString& dll, const QString& out)
     onMove(1, 7, 0, 10, ENTER_VISIBILITY, "");  // Alice: both -> alarm with the chosen sound
     CHECK(sounds == 1 && QDir::fromNativeSeparators(lastSound) == QDir::fromNativeSeparators(wav), "alarm did not play the chosen sound: " + lastSound);
 
-    // --- Reopening the alarm window shows what was saved
-    onMenu(1, PLUGIN_MENU_TYPE_GLOBAL, 1002, 0);
+    // --- With nothing ticked, Find Users opens the saved alarm as it is (the only way in: no menu entry)
+    onMenu(1, PLUGIN_MENU_TYPE_GLOBAL, 1005, 0);
+    CHECK(waitFor([] { return findVisible(QStringLiteral("gfFinderWindow")) != nullptr; }), "Find Users not reopened");
+    finder = findVisible(QStringLiteral("gfFinderWindow"));
+    groups = child<QListWidget>(finder, "gfGroupList");
+    waitFor([groups] { return groups->count() == 3; });
+    for (int i = 0; i < groups->count(); ++i)
+        groups->item(i)->setCheckState(Qt::Unchecked);
+    pump(100);
+    auto* toAlarm = child<QPushButton>(finder, "gfUseAsAlarmButton");
+    CHECK(toAlarm->isEnabled(), "alarm button disabled with nothing ticked — saved alarm unreachable");
+    toAlarm->click();
     waitFor([] { return findVisible(QStringLiteral("gfAlarmWindow")) != nullptr; });
     alarm = findVisible(QStringLiteral("gfAlarmWindow"));
-    CHECK(alarm, "alarm window not opened by Plugins menu item 1002");
+    CHECK(alarm, "alarm window not opened from Find Users with nothing ticked");
     CHECK(ticked(child<QListWidget>(alarm, "gfAlarmGroupList")) == (QStringList{"Guest", "Head Administrator"}), "saved alarm groups not shown");
     p.unload();
 }

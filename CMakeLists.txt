@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(groupfinder VERSION 1.4.0 LANGUAGES C CXX)
+project(groupfinder VERSION 1.4.1 LANGUAGES C CXX)
 
 # TeamSpeak 3 ships Qt 5.15.2 built with MSVC 2019 (x64). The plugin must link against the same
 # Qt (import libs from Qt 5.15.2 msvc2019_64) and be built in Release so it binds to Qt5Core.dll,
