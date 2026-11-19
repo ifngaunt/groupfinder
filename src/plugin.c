@@ -27,6 +27,7 @@
 #include "teamspeak/public_rare_definitions.h"
 #include "ts3_functions.h"
 
+#include "gf_meetings.h"
 #include "plugin.h"
 
 /* ------------------------------ Small utilities ------------------------------ */
@@ -298,10 +299,13 @@ const char* ts3plugin_name() {
 #endif
 }
 
-const char* ts3plugin_version() { return "1.2.0"; }
+#ifndef GF_VERSION
+#define GF_VERSION "dev"
+#endif
+const char* ts3plugin_version() { return GF_VERSION; }
 int ts3plugin_apiVersion() { return PLUGIN_API_VERSION; }
 const char* ts3plugin_author() { return "PhysicsGaunt"; }
-const char* ts3plugin_description() { return "Find users by (server) group + connect-alarm using the same matcher."; }
+const char* ts3plugin_description() { return "Find users by server group, connect alarm, and a meeting scheduler that moves you into channels at meeting time."; }
 
 void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3Functions = funcs; }
 
@@ -311,7 +315,64 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
+    gf_meetings_shutdown(); /* closes all meeting windows before the DLL unloads */
     if (pluginID) { free(pluginID); pluginID = NULL; }
+}
+
+/* Releases memory this plugin handed to the client (menus, hotkeys). */
+void ts3plugin_freeMemory(void* data) { free(data); }
+
+/* The "Settings" button in TS3's addon list opens the meeting scheduler. */
+int ts3plugin_offersConfigure() { return PLUGIN_OFFERS_CONFIGURE_QT_THREAD; }
+void ts3plugin_configure(void* handle, void* qParentWidget) {
+    (void)handle; (void)qParentWidget;
+    gf_meetings_open_scheduler();
+}
+
+/* Errors for requests made with our return codes (meeting moves) are reported by the scheduler. */
+int ts3plugin_onServerErrorEvent(uint64 schid, const char* errorMessage, unsigned int error, const char* returnCode, const char* extraMessage) {
+    (void)extraMessage;
+    return gf_meetings_on_server_error(schid, errorMessage, error, returnCode);
+}
+
+/* Bindable in TS3: Options -> Hotkeys -> Add -> Plugins -> Group Finder Plugin. */
+static const struct { const char* keyword; const char* description; } kHotkeys[] = {
+    {"gf_open_meetings", "Open meeting scheduler"},
+    {"gf_join_next",     "Join next meeting now"},
+    {"gf_cancel_move",   "Cancel pending meeting move"},
+    {"gf_alarm_toggle",  "Toggle connect alarm"},
+    {"gf_find_alarm",    "List online users matching alarm criteria"},
+};
+
+void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
+    const size_t n = sizeof(kHotkeys) / sizeof(kHotkeys[0]);
+    struct PluginHotkey** h = (struct PluginHotkey**)malloc(sizeof(struct PluginHotkey*) * (n + 1));
+    for (size_t i = 0; i < n; ++i) {
+        h[i] = (struct PluginHotkey*)malloc(sizeof(struct PluginHotkey));
+        _strcpy(h[i]->keyword, PLUGIN_HOTKEY_BUFSZ, kHotkeys[i].keyword);
+        _strcpy(h[i]->description, PLUGIN_HOTKEY_BUFSZ, kHotkeys[i].description);
+    }
+    h[n] = NULL;
+    *hotkeys = h;
+}
+
+void ts3plugin_onHotkeyEvent(const char* keyword) {
+    uint64 schid;
+    if (!keyword || gf_meetings_handle_hotkey(keyword)) return;
+    schid = ts3Functions.getCurrentServerConnectionHandlerID();
+    if (strcmp(keyword, "gf_alarm_toggle") == 0) {
+        g_alarm_enabled = !g_alarm_enabled;
+        alarm_save_for_server(schid);
+        alarm_print_status(schid);
+    } else if (strcmp(keyword, "gf_find_alarm") == 0) {
+        if (!g_alarm_query[0]) {
+            ts3Functions.printMessageToCurrentTab("[Alarm] No criteria set. Use /findgroup alarm set <groups...> first.");
+        } else {
+            char query[sizeof(g_alarm_query)];
+            _strcpy(query, sizeof(query), g_alarm_query);
+            ts3plugin_processCommand(schid, query); /* same output as typing /findgroup <criteria> */
+        }
+    }
 }
 
 void ts3plugin_registerPluginID(const char* id) {
@@ -351,6 +412,12 @@ void ts3plugin_registerPluginID(const char* id) {
 #endif
 
     if (!g_default_wav[0]) _strcpy(g_default_wav, sizeof(g_default_wav), "/sound/default.wav");
+
+    {
+        char cfgDir[PATH_BUFSIZE] = {0};
+        ts3Functions.getConfigPath(cfgDir, PATH_BUFSIZE);
+        gf_meetings_init(&ts3Functions, pluginID, cfgDir, g_default_wav);
+    }
 }
 
 /* Make our "/findgroup" command available */
@@ -359,6 +426,7 @@ const char* ts3plugin_commandKeyword() { return "findgroup"; }
 /* Load per-server state when connection becomes ready */
 void ts3plugin_onConnectStatusChangeEvent(uint64 schid, int newStatus, unsigned int errorNumber) {
     (void)errorNumber;
+    gf_meetings_on_connect_status(schid, newStatus);
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         cache_reset(schid);
         ts3Functions.requestServerGroupList(schid, NULL);
@@ -381,32 +449,44 @@ void ts3plugin_onServerGroupListFinishedEvent(uint64 schid) {
 }
 
 /* ------------------------------ Menu scaffolding ------------------------------ */
-enum { MENU_ID_GLOBAL_ALARM_TOGGLE = 1001, MENU_ID_GLOBAL_ALARM_SETQUERY = 1002 };
+enum {
+    MENU_ID_GLOBAL_ALARM_TOGGLE   = 1001,
+    MENU_ID_GLOBAL_ALARM_SETQUERY = 1002,
+    MENU_ID_GLOBAL_MEETINGS       = 1003, /* Plugins menu: open the meeting scheduler */
+    MENU_ID_CHANNEL_ADD_MEETING   = 1004  /* channel right-click: add a meeting for this channel */
+};
+
+static struct PluginMenuItem* make_menu_item(enum PluginMenuType type, int id, const char* text) {
+    struct PluginMenuItem* item = (struct PluginMenuItem*)malloc(sizeof(struct PluginMenuItem));
+    item->type = type;
+    item->id   = id;
+    _strcpy(item->text, PLUGIN_MENU_BUFSZ, text);
+    item->icon[0] = '\0';
+    return item;
+}
 
 void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
-    (void)menuIcon;
-    const size_t count = 2;
+    const size_t count = 4;
     struct PluginMenuItem** m = (struct PluginMenuItem**)malloc(sizeof(struct PluginMenuItem*) * (count + 1));
-
-    m[0] = (struct PluginMenuItem*)malloc(sizeof(struct PluginMenuItem));
-    m[0]->type = PLUGIN_MENU_TYPE_GLOBAL; m[0]->id = MENU_ID_GLOBAL_ALARM_TOGGLE;
-    _strcpy(m[0]->text, PLUGIN_MENU_BUFSZ, "Connect Alarm: Toggle");
-    m[0]->icon[0] = '\0';
-
-    m[1] = (struct PluginMenuItem*)malloc(sizeof(struct PluginMenuItem));
-    m[1]->type = PLUGIN_MENU_TYPE_GLOBAL; m[1]->id = MENU_ID_GLOBAL_ALARM_SETQUERY;
-    _strcpy(m[1]->text, PLUGIN_MENU_BUFSZ, "Connect Alarm: Set Criteria...");
-    m[1]->icon[0] = '\0';
-
-    m[2] = NULL;
+    m[0] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_MEETINGS,       "Meeting Scheduler\u2026");
+    m[1] = make_menu_item(PLUGIN_MENU_TYPE_CHANNEL, MENU_ID_CHANNEL_ADD_MEETING,   "Add meeting here\u2026");
+    m[2] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_TOGGLE,   "Connect Alarm: Toggle");
+    m[3] = make_menu_item(PLUGIN_MENU_TYPE_GLOBAL,  MENU_ID_GLOBAL_ALARM_SETQUERY, "Connect Alarm: Set Criteria...");
+    m[4] = NULL;
     *menuItems = m;
     *menuIcon = NULL;
 }
 
 void ts3plugin_onMenuItemEvent(uint64 schid, enum PluginMenuType type, int menuItemID, uint64 selectedItemID) {
-    (void)selectedItemID;
+    if (type == PLUGIN_MENU_TYPE_CHANNEL) {
+        if (menuItemID == MENU_ID_CHANNEL_ADD_MEETING) gf_meetings_add_for_channel(schid, selectedItemID);
+        return;
+    }
     if (type != PLUGIN_MENU_TYPE_GLOBAL) return;
     switch (menuItemID) {
+        case MENU_ID_GLOBAL_MEETINGS:
+            gf_meetings_open_scheduler();
+            break;
         case MENU_ID_GLOBAL_ALARM_TOGGLE:
             g_alarm_enabled = !g_alarm_enabled;
             alarm_save_for_server(schid);

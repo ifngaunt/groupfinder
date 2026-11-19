@@ -3,3 +3,5 @@
 .vscode
 
 *.ts3_plugin
+build/
+dist/
